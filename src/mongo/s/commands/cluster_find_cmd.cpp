@@ -36,6 +36,9 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/commands/cluster_aggregate.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/query/cluster_find.h"
 
@@ -90,10 +93,10 @@ public:
      * In order to run the find command, you must be authorized for the "find" action
      * type on the collection.
      */
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) final {
-        NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbname, cmdObj));
         auto hasTerm = cmdObj.hasField(kTermField);
         return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
     }
@@ -104,13 +107,7 @@ public:
                    ExplainCommon::Verbosity verbosity,
                    const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const final {
-        const string fullns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(fullns);
-        if (!nss.isValid()) {
-            return {ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid collection name: " << nss.ns()};
-        }
-
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         // Parse the command BSON to a QueryRequest.
         bool isExplain = true;
         auto qr = QueryRequest::makeFromFindCommand(std::move(nss), cmdObj, isExplain);
@@ -118,8 +115,34 @@ public:
             return qr.getStatus();
         }
 
-        return Strategy::explainFind(
+        auto result = Strategy::explainFind(
             txn, cmdObj, *qr.getValue(), verbosity, serverSelectionMetadata, out);
+
+        if (result == ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
+            auto resolvedView = ResolvedView::fromBSON(out->asTempObj());
+            out->resetToEmpty();
+
+            auto aggCmdOnView = qr.getValue().get()->asAggregationCommand();
+            if (!aggCmdOnView.isOK()) {
+                return aggCmdOnView.getStatus();
+            }
+
+            auto aggCmd = resolvedView.asExpandedViewAggregation(aggCmdOnView.getValue());
+            if (!aggCmd.isOK()) {
+                return aggCmd.getStatus();
+            }
+
+            int queryOptions = 0;
+            ClusterAggregate::Namespaces nsStruct;
+            nsStruct.requestedNss = std::move(nss);
+            nsStruct.executionNss = std::move(resolvedView.getNamespace());
+            auto status =
+                ClusterAggregate::runAggregate(txn, nsStruct, aggCmd.getValue(), queryOptions, out);
+            appendCommandStatus(*out, status);
+            return status;
+        }
+
+        return result;
     }
 
     bool run(OperationContext* txn,
@@ -131,12 +154,7 @@ public:
         // We count find command as a query op.
         globalOpCounters.gotQuery();
 
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::InvalidNamespace,
-                                        str::stream() << "Invalid collection name: " << nss.ns()});
-        }
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
         const bool isExplain = false;
         auto qr = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
@@ -161,8 +179,35 @@ public:
         // Do the work to generate the first batch of results. This blocks waiting to get responses
         // from the shard(s).
         std::vector<BSONObj> batch;
-        auto cursorId = ClusterFind::runQuery(txn, *cq.getValue(), readPref.getValue(), &batch);
+        BSONObj viewDefinition;
+        auto cursorId = ClusterFind::runQuery(
+            txn, *cq.getValue(), readPref.getValue(), &batch, &viewDefinition);
         if (!cursorId.isOK()) {
+            if (cursorId.getStatus() == ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
+                auto aggCmdOnView = cq.getValue()->getQueryRequest().asAggregationCommand();
+                if (!aggCmdOnView.isOK()) {
+                    return appendCommandStatus(result, aggCmdOnView.getStatus());
+                }
+
+                auto resolvedView = ResolvedView::fromBSON(viewDefinition);
+                auto aggCmd = resolvedView.asExpandedViewAggregation(aggCmdOnView.getValue());
+                if (!aggCmd.isOK()) {
+                    return appendCommandStatus(result, aggCmd.getStatus());
+                }
+
+                // We pass both the underlying collection namespace and the view namespace here. The
+                // underlying collection namespace is used to execute the aggregation on mongoD. Any
+                // cursor returned will be registered under the view namespace so that subsequent
+                // getMore and killCursors calls against the view have access.
+                ClusterAggregate::Namespaces nsStruct;
+                nsStruct.requestedNss = std::move(nss);
+                nsStruct.executionNss = std::move(resolvedView.getNamespace());
+                auto status = ClusterAggregate::runAggregate(
+                    txn, nsStruct, aggCmd.getValue(), options, &result);
+                appendCommandStatus(result, status);
+                return status.isOK();
+            }
+
             return appendCommandStatus(result, cursorId.getStatus());
         }
 

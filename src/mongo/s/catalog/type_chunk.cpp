@@ -35,6 +35,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -44,6 +45,7 @@ namespace mongo {
 const std::string ChunkType::ConfigNS = "config.chunks";
 
 const BSONField<std::string> ChunkType::name("_id");
+const BSONField<BSONObj> ChunkType::minShardID("_id");
 const BSONField<std::string> ChunkType::ns("ns");
 const BSONField<BSONObj> ChunkType::min("min");
 const BSONField<BSONObj> ChunkType::max("max");
@@ -57,36 +59,53 @@ namespace {
 const char kMinKey[] = "min";
 const char kMaxKey[] = "max";
 
+/**
+ * Extracts an Object value from 'obj's field 'fieldName'. Sets the result to 'bsonElement'.
+ */
+Status extractObject(const BSONObj& obj, const std::string& fieldName, BSONElement* bsonElement) {
+    Status elementStatus = bsonExtractTypedField(obj, fieldName, Object, bsonElement);
+    if (!elementStatus.isOK()) {
+        return {elementStatus.code(),
+                str::stream() << "The field '" << fieldName << "' cannot be parsed due to "
+                              << elementStatus.reason()};
+    }
+
+    if (bsonElement->Obj().isEmpty()) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "The field '" << fieldName << "' cannot be empty"};
+    }
+
+    return Status::OK();
+}
+
 }  // namespace
 
 ChunkRange::ChunkRange(BSONObj minKey, BSONObj maxKey)
-    : _minKey(std::move(minKey)), _maxKey(std::move(maxKey)) {}
+    : _minKey(std::move(minKey)), _maxKey(std::move(maxKey)) {
+    dassert(SimpleBSONObjComparator::kInstance.evaluate(_minKey < _maxKey));
+}
 
 StatusWith<ChunkRange> ChunkRange::fromBSON(const BSONObj& obj) {
     BSONElement minKey;
     {
-        Status minKeyStatus = bsonExtractTypedField(obj, kMinKey, Object, &minKey);
+        Status minKeyStatus = extractObject(obj, kMinKey, &minKey);
         if (!minKeyStatus.isOK()) {
-            return {minKeyStatus.code(),
-                    str::stream() << "Invalid min key due to " << minKeyStatus.reason()};
-        }
-
-        if (minKey.Obj().isEmpty()) {
-            return {ErrorCodes::BadValue, "The min key cannot be empty"};
+            return minKeyStatus;
         }
     }
 
     BSONElement maxKey;
     {
-        Status maxKeyStatus = bsonExtractTypedField(obj, kMaxKey, Object, &maxKey);
+        Status maxKeyStatus = extractObject(obj, kMaxKey, &maxKey);
         if (!maxKeyStatus.isOK()) {
-            return {maxKeyStatus.code(),
-                    str::stream() << "Invalid max key due to " << maxKeyStatus.reason()};
+            return maxKeyStatus;
         }
+    }
 
-        if (maxKey.Obj().isEmpty()) {
-            return {ErrorCodes::BadValue, "The max key cannot be empty"};
-        }
+    if (SimpleBSONObjComparator::kInstance.evaluate(minKey.Obj() >= maxKey.Obj())) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "min: " << minKey.Obj() << " should be less than max: "
+                              << maxKey.Obj()};
     }
 
     return ChunkRange(minKey.Obj().getOwned(), maxKey.Obj().getOwned());
@@ -113,7 +132,7 @@ bool ChunkRange::operator!=(const ChunkRange& other) const {
     return !(*this == other);
 }
 
-StatusWith<ChunkType> ChunkType::fromBSON(const BSONObj& source) {
+StatusWith<ChunkType> ChunkType::fromConfigBSON(const BSONObj& source) {
     ChunkType chunk;
 
     {
@@ -165,6 +184,119 @@ StatusWith<ChunkType> ChunkType::fromBSON(const BSONObj& source) {
     return chunk;
 }
 
+BSONObj ChunkType::toConfigBSON() const {
+    BSONObjBuilder builder;
+    if (_ns && _min)
+        builder.append(name.name(), getName());
+    if (_ns)
+        builder.append(ns.name(), getNS());
+    if (_min)
+        builder.append(min.name(), getMin());
+    if (_max)
+        builder.append(max.name(), getMax());
+    if (_shard)
+        builder.append(shard.name(), getShard().toString());
+    if (_version)
+        _version->appendForChunk(&builder);
+    if (_jumbo)
+        builder.append(jumbo.name(), getJumbo());
+
+    return builder.obj();
+}
+
+StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source, const OID& epoch) {
+    ChunkType chunk;
+
+    {
+        BSONElement minKey;
+        Status minKeyStatus = extractObject(source, minShardID.name(), &minKey);
+        if (!minKeyStatus.isOK()) {
+            return minKeyStatus;
+        }
+
+        BSONElement maxKey;
+        Status maxKeyStatus = extractObject(source, max.name(), &maxKey);
+        if (!maxKeyStatus.isOK()) {
+            return maxKeyStatus;
+        }
+
+        if (SimpleBSONObjComparator::kInstance.evaluate(minKey.Obj() >= maxKey.Obj())) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "min: " << minKey.Obj() << " should be less than max: "
+                                  << maxKey.Obj()};
+        }
+
+        chunk._min = minKey.Obj().getOwned();
+        chunk._max = maxKey.Obj().getOwned();
+    }
+
+    {
+        std::string chunkShard;
+        Status status = bsonExtractStringField(source, shard.name(), &chunkShard);
+        if (!status.isOK())
+            return status;
+        chunk._shard = chunkShard;
+    }
+
+    {
+        auto statusWithChunkVersion = ChunkVersion::parseFromBSONAndSetEpoch(source, epoch);
+        if (!statusWithChunkVersion.isOK()) {
+            return statusWithChunkVersion.getStatus();
+        }
+        chunk._version = std::move(statusWithChunkVersion.getValue());
+    }
+
+    return chunk;
+}
+
+BSONObj ChunkType::toShardBSON() const {
+    BSONObjBuilder builder;
+    invariant(_min);
+    invariant(_max);
+    invariant(_shard);
+    invariant(_version);
+    builder.append(minShardID.name(), getMin());
+    builder.append(max.name(), getMax());
+    builder.append(shard.name(), getShard().toString());
+    builder.appendTimestamp(DEPRECATED_lastmod.name(), _version->toLong());
+    return builder.obj();
+}
+
+std::string ChunkType::getName() const {
+    invariant(_ns);
+    invariant(_min);
+    return genID(*_ns, *_min);
+}
+
+void ChunkType::setNS(const std::string& ns) {
+    invariant(!ns.empty());
+    _ns = ns;
+}
+
+void ChunkType::setMin(const BSONObj& min) {
+    invariant(!min.isEmpty());
+    _min = min;
+}
+
+void ChunkType::setMax(const BSONObj& max) {
+    invariant(!max.isEmpty());
+    _max = max;
+}
+
+void ChunkType::setVersion(const ChunkVersion& version) {
+    invariant(version.isSet());
+    _version = version;
+}
+
+void ChunkType::setShard(const ShardId& shard) {
+    invariant(shard.isValid());
+    _shard = shard;
+}
+
+void ChunkType::setJumbo(bool jumbo) {
+    _jumbo = jumbo;
+}
+
 std::string ChunkType::genID(StringData ns, const BSONObj& o) {
     StringBuilder buf;
     buf << ns << "-";
@@ -202,8 +334,9 @@ Status ChunkType::validate() const {
 
     // 'min' and 'max' must share the same fields.
     if (_min->nFields() != _max->nFields()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "min and max have a different number of keys");
+        return {ErrorCodes::BadValue,
+                str::stream() << "min and max don't have the same number of keys: " << *_min << ", "
+                              << *_max};
     }
 
     BSONObjIterator minIt(getMin());
@@ -212,77 +345,25 @@ Status ChunkType::validate() const {
         BSONElement minElem = minIt.next();
         BSONElement maxElem = maxIt.next();
         if (strcmp(minElem.fieldName(), maxElem.fieldName())) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "min and max must have the same set of keys");
+            return {ErrorCodes::BadValue,
+                    str::stream() << "min and max don't have matching keys: " << *_min << ", "
+                                  << *_max};
         }
     }
 
     // 'max' should be greater than 'min'.
     if (_min->woCompare(getMax()) >= 0) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "max key must be greater than min key");
+        return {ErrorCodes::BadValue,
+                str::stream() << "max is not greater than min: " << *_min << ", " << *_max};
     }
 
     return Status::OK();
 }
 
-BSONObj ChunkType::toBSON() const {
-    BSONObjBuilder builder;
-    if (_ns && _min)
-        builder.append(name.name(), getName());
-    if (_ns)
-        builder.append(ns.name(), getNS());
-    if (_min)
-        builder.append(min.name(), getMin());
-    if (_max)
-        builder.append(max.name(), getMax());
-    if (_shard)
-        builder.append(shard.name(), getShard().toString());
-    if (_version)
-        _version->appendForChunk(&builder);
-    if (_jumbo)
-        builder.append(jumbo.name(), getJumbo());
-
-    return builder.obj();
-}
-
 std::string ChunkType::toString() const {
-    return toBSON().toString();
-}
-
-std::string ChunkType::getName() const {
-    invariant(_ns);
-    invariant(_min);
-    return genID(*_ns, *_min);
-}
-
-void ChunkType::setNS(const std::string& ns) {
-    invariant(!ns.empty());
-    _ns = ns;
-}
-
-void ChunkType::setMin(const BSONObj& min) {
-    invariant(!min.isEmpty());
-    _min = min;
-}
-
-void ChunkType::setMax(const BSONObj& max) {
-    invariant(!max.isEmpty());
-    _max = max;
-}
-
-void ChunkType::setVersion(const ChunkVersion& version) {
-    invariant(version.isSet());
-    _version = version;
-}
-
-void ChunkType::setShard(const ShardId& shard) {
-    invariant(shard.isValid());
-    _shard = shard;
-}
-
-void ChunkType::setJumbo(bool jumbo) {
-    _jumbo = jumbo;
+    // toConfigBSON will include all the set fields, whereas toShardBSON includes only a subset and
+    // requires them to be set.
+    return toConfigBSON().toString();
 }
 
 }  // namespace mongo

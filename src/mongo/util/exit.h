@@ -35,15 +35,20 @@
 namespace mongo {
 
 /**
- * Quickly determines if the shutdown flag is set.  May not be definitive.
+ * Determines if the shutdown flag is set.
+ *
+ * Calling this function is deprecated because modules that consult it
+ * cannot engage in an orderly, coordinated shutdown. Instead, such
+ * modules tend to just stop working at some point after mongo::shutdown() is
+ * invoked, without regard to whether modules that depend on them have
+ * already shut down.
  */
-bool inShutdown();
+bool globalInShutdownDeprecated();
 
 /**
- * Definitively determines if the shutdown flag is set.  Calling this is more expensive
- * than inShutdown().
+ * Does not return until all shutdown tasks have run.
  */
-bool inShutdownStrict();
+ExitCode waitForShutdown();
 
 /**
  * Registers a new shutdown task to be called when shutdown or

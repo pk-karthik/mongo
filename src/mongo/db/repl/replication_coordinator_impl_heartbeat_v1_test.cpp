@@ -369,7 +369,7 @@ TEST_F(ReplCoordHBV1Test, ArbiterRecordsCommittedOpTimeFromHeartbeatMetadata) {
                                            << "syncSourceIndex"
                                            << 1)));
         ASSERT_OK(metadata.getStatus());
-        getReplCoord()->processReplSetMetadata(metadata.getValue());
+        getReplCoord()->processReplSetMetadata(metadata.getValue(), true);
 
         ASSERT_EQ(getReplCoord()->getMyLastAppliedOpTime().getTimestamp(), expected.getTimestamp());
     };
@@ -447,7 +447,8 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
     ASSERT_NOT_EQUALS(opTime.getTerm(), getTopoCoord().getTerm());
 
     BSONObjBuilder statusBuilder;
-    ASSERT_OK(getReplCoord()->processReplSetGetStatus(&statusBuilder));
+    ASSERT_OK(getReplCoord()->processReplSetGetStatus(
+        &statusBuilder, ReplicationCoordinator::ReplSetGetStatusResponseStyle::kBasic));
     auto statusObj = statusBuilder.obj();
     unittest::log() << "replica set status = " << statusObj;
 

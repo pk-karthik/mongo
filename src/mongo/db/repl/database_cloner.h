@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <list>
 #include <string>
 #include <vector>
@@ -39,12 +40,15 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/collection_cloner.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
+class OldThreadPool;
+
 namespace repl {
 namespace {
 
@@ -59,13 +63,16 @@ class DatabaseCloner : public BaseCloner {
 
 public:
     struct Stats {
+        std::string dbname;
         Date_t start;
         Date_t end;
         size_t collections{0};
         size_t clonedCollections{0};
+        std::vector<CollectionCloner::Stats> collectionStats;
 
         std::string toString() const;
         BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
     };
 
     /**
@@ -103,8 +110,11 @@ public:
      * 'onCompletion' will be called exactly once.
      *
      * Takes ownership of the passed StorageInterface object.
+     *
+     * 'listCollectionsFilter' will be extended to include collections only, filtering out views.
      */
-    DatabaseCloner(ReplicationExecutor* executor,
+    DatabaseCloner(executor::TaskExecutor* executor,
+                   OldThreadPool* dbWorkThreadPool,
                    const HostAndPort& source,
                    const std::string& dbname,
                    const BSONObj& listCollectionsFilter,
@@ -116,23 +126,23 @@ public:
     virtual ~DatabaseCloner();
 
     /**
-     * Returns collection info objects read from listCollections result.
-     * This will return an empty vector until we have processed the last
-     * batch of results from listCollections.
+     * Returns collection info objects read from listCollections result and will not include views.
      */
-    const std::vector<BSONObj>& getCollectionInfos() const;
+    const std::vector<BSONObj>& getCollectionInfos_forTest() const;
 
     std::string getDiagnosticString() const override;
 
     bool isActive() const override;
 
-    Status start() override;
+    Status startup() noexcept override;
 
-    void cancel() override;
+    void shutdown() override;
 
-    void wait() override;
+    void join() override;
 
     DatabaseCloner::Stats getStats() const;
+
+    std::string getDBName() const;
 
     //
     // Testing only functions below.
@@ -143,7 +153,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
 
     /**
      * Overrides how executor starts a collection cloner.
@@ -152,7 +162,23 @@ public:
      */
     void setStartCollectionClonerFn(const StartCollectionClonerFn& startCollectionCloner);
 
+    // State transitions:
+    // PreStart --> Running --> ShuttingDown --> Complete
+    // It is possible to skip intermediate states. For example,
+    // Calling shutdown() when the cloner has not started will transition from PreStart directly
+    // to Complete.
+    // This enum class is made public for testing.
+    enum class State { kPreStart, kRunning, kShuttingDown, kComplete };
+
+    /**
+     * Returns current database cloner state.
+     * For testing only.
+     */
+    State getState_forTest() const;
+
 private:
+    bool _isActive_inlock() const;
+
     /**
      * Read collection names and options from listCollections result.
      */
@@ -190,7 +216,8 @@ private:
     //
     mutable stdx::mutex _mutex;
     mutable stdx::condition_variable _condition;                 // (M)
-    ReplicationExecutor* _executor;                              // (R)
+    executor::TaskExecutor* _executor;                           // (R)
+    OldThreadPool* _dbWorkThreadPool;                            // (R)
     const HostAndPort _source;                                   // (R)
     const std::string _dbname;                                   // (R)
     const BSONObj _listCollectionsFilter;                        // (R)
@@ -199,7 +226,6 @@ private:
     CollectionCallbackFn
         _collectionWork;       // (R) Invoked once for every successfully started collection cloner.
     CallbackFn _onCompletion;  // (R) Invoked once when cloning completes or fails.
-    bool _active = false;      // _active is true when database cloner is started.
     Fetcher _listCollectionsFetcher;  // (R) Fetcher instance for running listCollections command.
     // Collection info objects returned from listCollections.
     // Format of each document:
@@ -217,7 +243,16 @@ private:
         _scheduleDbWorkFn;  // (RT) Function for scheduling database work using the executor.
     StartCollectionClonerFn _startCollectionCloner;  // (RT)
     Stats _stats;                                    // (M) Stats about what this instance did.
+
+    // Current database cloner state. See comments for State enum class for details.
+    State _state = State::kPreStart;  // (M)
 };
+
+/**
+ * Insertion operator for DatabaseCloner::State. Formats database cloner state for output stream.
+ * For testing only.
+ */
+std::ostream& operator<<(std::ostream& os, const DatabaseCloner::State& state);
 
 }  // namespace repl
 }  // namespace mongo

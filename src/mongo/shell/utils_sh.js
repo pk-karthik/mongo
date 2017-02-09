@@ -55,9 +55,9 @@ sh._writeBalancerStateDeprecated = function(onOrNot) {
 
 sh.help = function() {
     print("\tsh.addShard( host )                       server:port OR setname/server:port");
-    print("\tsh.addShardTag(shard,tag)                 adds the tag to the shard");
-    print(
-        "\tsh.addTagRange(fullName,min,max,tag)      tags the specified range of the given collection");
+    print("\tsh.addShardToZone(shard,zone)             adds the shard to the zone");
+    print("\tsh.updateZoneKeyRange(fullName,min,max,zone)      " +
+          "assigns the specified range of the given collection to a zone");
     print("\tsh.disableBalancing(coll)                 disable balancing on one collection");
     print("\tsh.enableBalancing(coll)                  re-enable balancing on one collection");
     print("\tsh.enableSharding(dbname)                 enables sharding on the database dbname");
@@ -66,10 +66,10 @@ sh.help = function() {
         "\tsh.isBalancerRunning()                    return true if the balancer has work in progress on any mongos");
     print(
         "\tsh.moveChunk(fullName,find,to)            move the chunk where 'find' is to 'to' (name of shard)");
-    print("\tsh.removeShardTag(shard,tag)              removes the tag from the shard");
+    print("\tsh.removeShardFromZone(shard,zone)      removes the shard from zone");
     print(
-        "\tsh.removeTagRange(fullName,min,max,tag)   removes the tagged range of the given collection");
-    print("\tsh.shardCollection(fullName,key,unique)   shards the collection");
+        "\tsh.removeRangeFromZone(fullName,min,max)   removes the range of the given collection from any zone");
+    print("\tsh.shardCollection(fullName,key,unique,options)   shards the collection");
     print(
         "\tsh.splitAt(fullName,middle)               splits the chunk that middle is in at middle");
     print(
@@ -80,7 +80,7 @@ sh.help = function() {
     print(
         "\tsh.stopBalancer()                         stops the balancer so chunks are not balanced automatically");
     print("\tsh.disableAutoSplit()                   disable autoSplit on one collection");
-    print("\tsh.enableAutoSplit()                    re-eable autoSplit on one colleciton");
+    print("\tsh.enableAutoSplit()                    re-enable autoSplit on one collection");
     print("\tsh.getShouldAutoSplit()                 returns whether autosplit is enabled");
 };
 
@@ -98,7 +98,7 @@ sh.enableSharding = function(dbname) {
     return sh._adminCommand({enableSharding: dbname});
 };
 
-sh.shardCollection = function(fullName, key, unique) {
+sh.shardCollection = function(fullName, key, unique, options) {
     sh._checkFullName(fullName);
     assert(key, "need a key");
     assert(typeof(key) == "object", "key needs to be an object");
@@ -106,6 +106,12 @@ sh.shardCollection = function(fullName, key, unique) {
     var cmd = {shardCollection: fullName, key: key};
     if (unique)
         cmd.unique = true;
+    if (options) {
+        if (typeof(options) !== "object") {
+            throw new Error("options must be an object");
+        }
+        Object.extend(cmd, options);
+    }
 
     return sh._adminCommand(cmd);
 };
@@ -145,49 +151,22 @@ sh.getBalancerState = function(configDB) {
 sh.isBalancerRunning = function(configDB) {
     if (configDB === undefined)
         configDB = sh._getConfigDB();
-    var x = configDB.locks.findOne({_id: "balancer"});
-    if (x == null) {
-        print("config.locks collection empty or missing. be sure you are connected to a mongos");
-        return false;
-    }
-    return x.state > 0;
-};
 
-sh.getBalancerHost = function(configDB) {
-    if (configDB === undefined)
-        configDB = sh._getConfigDB();
-    var x = configDB.locks.findOne({_id: "balancer"});
-    if (x == null) {
-        print(
-            "config.locks collection does not contain balancer lock. be sure you are connected to a mongos");
-        return "";
-    }
-    return x.process.match(/[^:]+:[^:]+/)[0];
+    var result = configDB.adminCommand({balancerStatus: 1});
+    return assert.commandWorked(result).inBalancerRound;
 };
 
 sh.stopBalancer = function(timeoutMs, interval) {
     timeoutMs = timeoutMs || 60000;
 
     var result = db.adminCommand({balancerStop: 1, maxTimeMS: timeoutMs});
-    if (result.code === ErrorCodes.CommandNotFound) {
-        // For backwards compatibility, use the legacy balancer stop method
-        result = sh._writeBalancerStateDeprecated(false);
-        sh.waitForBalancer(false, timeoutMs, interval);
-        return result;
-    }
-
     return assert.commandWorked(result);
 };
 
 sh.startBalancer = function(timeoutMs, interval) {
-    var result = db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
-    if (result.code === ErrorCodes.CommandNotFound) {
-        // For backwards compatibility, use the legacy balancer start method
-        result = sh._writeBalancerStateDeprecated(true);
-        sh.waitForBalancer(true, timeoutMs, interval);
-        return result;
-    }
+    timeoutMs = timeoutMs || 60000;
 
+    var result = db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
     return assert.commandWorked(result);
 };
 
@@ -214,46 +193,9 @@ sh.getShouldAutoSplit = function(configDB) {
         configDB = sh._getConfigDB();
     var autosplit = configDB.settings.findOne({_id: 'autosplit'});
     if (autosplit == null) {
-        print(
-            "No autosplit document found in config.settings collection. Be sure you are connected to a mongos");
         return true;
     }
     return autosplit.enabled;
-};
-
-sh._waitForDLock = function(lockId, onOrNot, timeout, interval) {
-    // Wait for balancer to be on or off
-    // Can also wait for particular balancer state
-    var state = onOrNot;
-    var configDB = sh._getConfigDB();
-
-    var beginTS = undefined;
-    if (state == undefined) {
-        var currLock = configDB.locks.findOne({_id: lockId});
-        if (currLock != null)
-            beginTS = currLock.ts;
-    }
-
-    var lockStateOk = function() {
-        var lock = configDB.locks.findOne({_id: lockId});
-
-        if (state == false)
-            return !lock || lock.state == 0;
-        if (state == true)
-            return lock && lock.state == 2;
-        if (state == undefined)
-            return (beginTS == undefined && lock) ||
-                (beginTS != undefined && (!lock || lock.ts + "" != beginTS + ""));
-        else
-            return lock && lock.state == state;
-    };
-
-    assert.soon(
-        lockStateOk,
-        "Waited too long for lock " + lockId + " to " +
-            (state == true ? "lock" : (state == false ? "unlock" : "change to state " + state)),
-        timeout,
-        interval);
 };
 
 sh.waitForPingChange = function(activePings, timeout, interval) {
@@ -291,50 +233,6 @@ sh.waitForPingChange = function(activePings, timeout, interval) {
     return remainingPings;
 };
 
-sh.waitForBalancer = function(onOrNot, timeout, interval) {
-    // If we're waiting for the balancer to turn on or switch state or go to a particular state
-    if (onOrNot) {
-        // Just wait for the balancer lock to change, can't ensure we'll ever see it actually locked
-        sh._waitForDLock("balancer", undefined, timeout, interval);
-    } else {
-        // Otherwise we need to wait until we're sure balancing stops
-        var activePings = [];
-        sh._getConfigDB().mongos.find().forEach(function(ping) {
-            if (!ping.waiting)
-                activePings.push(ping);
-        });
-
-        print("Waiting for active hosts...");
-        activePings = sh.waitForPingChange(activePings, 60 * 1000);
-
-        // After 1min, we assume that all hosts with unchanged pings are either offline (this is
-        // enough time for a full errored balance round, if a network issue, which would reload
-        // settings) or balancing, which we wait for next. Legacy hosts we always have to wait for.
-        print("Waiting for the balancer lock...");
-
-        // Wait for the balancer lock to become inactive. We can guess this is stale after 15 mins,
-        // but need to double-check manually.
-        try {
-            sh._waitForDLock("balancer", false, 15 * 60 * 1000);
-        } catch (e) {
-            print(
-                "Balancer still may be active, you must manually verify this is not the case using the config.changelog collection.");
-            throw Error(e);
-        }
-
-        print("Waiting again for active hosts after balancer is off...");
-
-        // Wait a short time afterwards, to catch the host which was balancing earlier
-        activePings = sh.waitForPingChange(activePings, 5 * 1000);
-
-        // Warn about all the stale host pings remaining
-        activePings.forEach(function(activePing) {
-            print("Warning : host " + activePing._id + " seems to have been offline since " +
-                  activePing.ping);
-        });
-    }
-};
-
 sh.disableBalancing = function(coll) {
     if (coll === undefined) {
         throw Error("Must specify collection");
@@ -347,7 +245,9 @@ sh.disableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": true}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": true}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.enableBalancing = function(coll) {
@@ -362,7 +262,9 @@ sh.enableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": false}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": false}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 /*
@@ -413,24 +315,39 @@ sh._lastMigration = function(ns) {
 };
 
 sh.addShardTag = function(shard, tag) {
+    var result = sh.addShardToZone(shard, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
     return assert.writeOK(config.shards.update(
-        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeShardTag = function(shard, tag) {
+    var result = sh.removeShardFromZone(shard, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
-    return assert.writeOK(
-        config.shards.update({_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+    return assert.writeOK(config.shards.update(
+        {_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.addTagRange = function(ns, min, max, tag) {
+    var result = sh.updateZoneKeyRange(ns, min, max, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     if (bsonWoCompare(min, max) == 0) {
         throw new Error("min and max cannot be the same");
     }
@@ -439,10 +356,15 @@ sh.addTagRange = function(ns, min, max, tag) {
     return assert.writeOK(
         config.tags.update({_id: {ns: ns, min: min}},
                            {_id: {ns: ns, min: min}, ns: ns, min: min, max: max, tag: tag},
-                           {upsert: true, writeConcern: {w: 'majority'}}));
+                           {upsert: true, writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeTagRange = function(ns, min, max, tag) {
+    var result = sh.removeRangeFromZone(ns, min, max);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     // warn if the namespace does not exist, even dropped
     if (config.collections.findOne({_id: ns}) == null) {
@@ -455,20 +377,24 @@ sh.removeTagRange = function(ns, min, max, tag) {
     // max and tag criteria not really needed, but including them avoids potentially unexpected
     // behavior.
     return assert.writeOK(config.tags.remove({_id: {ns: ns, min: min}, max: max, tag: tag},
-                                             {writeConcern: {w: 'majority'}}));
+                                             {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
-sh.getBalancerLockDetails = function(configDB) {
-    if (configDB === undefined)
-        configDB = db.getSiblingDB('config');
-    var lock = configDB.locks.findOne({_id: 'balancer'});
-    if (lock == null) {
-        return null;
-    }
-    if (lock.state == 0) {
-        return null;
-    }
-    return lock;
+sh.addShardToZone = function(shardName, zoneName) {
+    return sh._getConfigDB().adminCommand({addShardToZone: shardName, zone: zoneName});
+};
+
+sh.removeShardFromZone = function(shardName, zoneName) {
+    return sh._getConfigDB().adminCommand({removeShardFromZone: shardName, zone: zoneName});
+};
+
+sh.updateZoneKeyRange = function(ns, min, max, zoneName) {
+    return sh._getConfigDB().adminCommand(
+        {updateZoneKeyRange: ns, min: min, max: max, zone: zoneName});
+};
+
+sh.removeRangeFromZone = function(ns, min, max) {
+    return sh._getConfigDB().adminCommand({updateZoneKeyRange: ns, min: min, max: max, zone: null});
 };
 
 sh.getBalancerWindow = function(configDB) {
@@ -487,7 +413,7 @@ sh.getBalancerWindow = function(configDB) {
 sh.getActiveMigrations = function(configDB) {
     if (configDB === undefined)
         configDB = db.getSiblingDB('config');
-    var activeLocks = configDB.locks.find({_id: {$ne: "balancer"}, state: {$eq: 2}});
+    var activeLocks = configDB.locks.find({state: {$eq: 2}});
     var result = [];
     if (activeLocks != null) {
         activeLocks.forEach(function(lock) {
@@ -657,12 +583,6 @@ function printShardingStatus(configDB, verbose) {
 
     // Is the balancer currently active
     output("\tCurrently running:  " + (sh.isBalancerRunning(configDB) ? "yes" : "no"));
-
-    // Output details of the current balancer round
-    var balLock = sh.getBalancerLockDetails(configDB);
-    if (balLock) {
-        output("\t\tBalancer lock taken at " + balLock.when + " by " + balLock.who);
-    }
 
     // Output the balancer window
     var balSettings = sh.getBalancerWindow(configDB);

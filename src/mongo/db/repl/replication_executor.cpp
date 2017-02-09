@@ -56,9 +56,10 @@ using executor::NetworkInterface;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface, int64_t prngSeed)
+ReplicationExecutor::ReplicationExecutor(std::unique_ptr<NetworkInterface> netInterface,
+                                         int64_t prngSeed)
     : _random(prngSeed),
-      _networkInterface(netInterface),
+      _networkInterface(std::move(netInterface)),
       _inShutdown(false),
       _dblockWorkers(OldThreadPool::DoNotStartThreadsTag(), 3, "replExecDBWorker-"),
       _dblockTaskRunner(&_dblockWorkers),
@@ -69,7 +70,7 @@ ReplicationExecutor::~ReplicationExecutor() {
     invariant(!_executorThread.joinable());
 }
 
-BSONObj ReplicationExecutor::getDiagnosticBSON() {
+BSONObj ReplicationExecutor::getDiagnosticBSON() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     BSONObjBuilder builder;
 
@@ -104,7 +105,7 @@ BSONObj ReplicationExecutor::getDiagnosticBSON() {
     return builder.obj();
 }
 
-std::string ReplicationExecutor::getDiagnosticString() {
+std::string ReplicationExecutor::getDiagnosticString() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _getDiagnosticString_inlock();
 }
@@ -317,7 +318,7 @@ void ReplicationExecutor::_finishRemoteCommand(const RemoteCommandRequest& reque
     }
 
     LOG(4) << "Received remote response: "
-           << (response.isOK() ? response.getValue().toString() : response.getStatus().toString());
+           << (response.isOK() ? response.toString() : response.status.toString());
 
     callback->_callbackFn =
         stdx::bind(remoteCommandFinished, stdx::placeholders::_1, cb, request, response);
@@ -540,6 +541,10 @@ StatusWith<ReplicationExecutor::CallbackHandle> ReplicationExecutor::enqueueWork
     work.readyDate = Date_t();
     queue->splice(queue->end(), _freeQueue, iter);
     return StatusWith<CallbackHandle>(work.callback);
+}
+
+void ReplicationExecutor::waitForDBWork_forTest() {
+    _dblockTaskRunner.join();
 }
 
 ReplicationExecutor::WorkItem::WorkItem() : generation(0U), isNetworkOperation(false) {}

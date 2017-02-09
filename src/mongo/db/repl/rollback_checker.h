@@ -46,10 +46,14 @@ class Mutex;
  *    sync source changes, make a new RollbackChecker.
  * 2) Call reset(), either synchronously or asynchronously, so that the RollbackChecker retrieves
  *    the state it needs from the sync source to check for rollbacks.
- * 3) Call checkForRollback(), passing in the next action to check if there was a rollback at the
- *    sync source. If there is a rollback or another error, the error function provided will be
- *    called. This error could be an UnrecoverableRollbackError, when there is a rollback.
- *    Alternatively, call hasHadRollback() which synchonously checks for a rollback and returns
+ * 3) Call checkForRollback(), passing in a 'nextAction' callback. This checks if there was a
+ *    rollback at the sync source. If there is a rollback or another error, the 'nextAction'
+ *    callback will be invoked. This error could be an UnrecoverableRollbackError, when there is a
+ *    rollback.
+ *    The only case where 'nextAction' is not called is when checkForRollback fails because the
+ *    task executor is unable to schedule the remote replSetGetRBID command. In this case,
+ *    checkForRollback() returns the error from executorTaskExecutor::scheduleRemoteCommand().
+ *    Alternatively, call hasHadRollback() which synchronously checks for a rollback and returns
  *    true if any error occurs. Checking for a rollback does not reset the baseline rbid.
  * 4) Repeat steps 2 and 3 as needed.
  *
@@ -58,7 +62,10 @@ class RollbackChecker {
     MONGO_DISALLOW_COPYING(RollbackChecker);
 
 public:
-    using CallbackFn = stdx::function<void(const Status& status)>;
+    // Rollback checker result - true if rollback occurred; false if rollback IDs
+    // were the same; Otherwise, error status indicating why rollback check failed.
+    using Result = StatusWith<bool>;
+    using CallbackFn = stdx::function<void(const Result& result)>;
     using RemoteCommandCallbackFn = executor::TaskExecutor::RemoteCommandCallbackFn;
     using CallbackHandle = executor::TaskExecutor::CallbackHandle;
 
@@ -67,21 +74,20 @@ public:
     virtual ~RollbackChecker();
 
     // Checks whether the the sync source has had a rollback since the last time reset was called,
-    // and then calls the nextAction with a status specifying what should occur next. The status
-    // will either be OK if there was no rollback and no error, UnrecoverableRollbackError if there
-    // was a rollback, or another status if the command failed. The nextAction should account for
-    // each of these cases.
-    CallbackHandle checkForRollback(const CallbackFn& nextAction);
+    // and then calls the nextAction with the rollback checker result. An error status
+    // will be passed to the callback if the RBID cannot be determined or if
+    // the callback was canceled.
+    StatusWith<CallbackHandle> checkForRollback(const CallbackFn& nextAction);
 
     // Synchronously checks if there has been a rollback and returns a boolean specifying if one
-    // has occurred. If any error occurs this will return true.
-    bool hasHadRollback();
+    // has occurred.
+    Result hasHadRollback();
 
     // Resets the state used to decide if a rollback occurs, and then calls the nextAction with a
     // status specifying what should occur next. The status will either be OK if there was no
     // error or another status if the command failed. The nextAction should account for
     // each of these cases.
-    CallbackHandle reset(const CallbackFn& nextAction);
+    StatusWith<CallbackHandle> reset(const CallbackFn& nextAction);
 
     // Synchronously calls reset and returns the Status of the command.
     Status reset_sync();
@@ -100,9 +106,9 @@ private:
     bool _checkForRollback_inlock(int remoteRBID);
 
     // Schedules a remote command to get the rbid at the sync source and then calls the nextAction.
-    // If there is an error scheduling the call, it calls the errorFn with the status.
-    CallbackHandle _scheduleGetRollbackId(const RemoteCommandCallbackFn& nextAction,
-                                          const CallbackFn& errorFn);
+    // If there is an error scheduling the call, it returns the error from
+    // TaskExecutor::scheduleRemoteCommand().
+    StatusWith<CallbackHandle> _scheduleGetRollbackId(const RemoteCommandCallbackFn& nextAction);
 
     // Assumes a lock has been taken. Sets the current rbid used as the baseline for rollbacks.
     void _setRBID_inlock(int rbid);

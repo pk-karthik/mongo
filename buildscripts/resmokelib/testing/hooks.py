@@ -7,9 +7,11 @@ from __future__ import absolute_import
 
 import os
 import sys
+import time
 
 import bson
 import pymongo
+import random
 
 from . import fixtures
 from . import testcases
@@ -57,7 +59,6 @@ class CustomBehavior(object):
         self.logger_name = self.__class__.__name__
         self.description = description
 
-
     def before_suite(self, test_report):
         """
         The test runner calls this exactly once before they start
@@ -76,20 +77,12 @@ class CustomBehavior(object):
     def before_test(self, test, test_report):
         """
         Each test will call this before it executes.
-
-        Raises a TestFailure if the test should be marked as a failure,
-        or a ServerFailure if the fixture exits uncleanly or
-        unexpectedly.
         """
         pass
 
     def after_test(self, test, test_report):
         """
         Each test will call this after it executes.
-
-        Raises a TestFailure if the test should be marked as a failure,
-        or a ServerFailure if the fixture exits uncleanly or
-        unexpectedly.
         """
         pass
 
@@ -105,6 +98,7 @@ class CleanEveryN(CustomBehavior):
     def __init__(self, logger, fixture, n=DEFAULT_N):
         description = "CleanEveryN (restarts the fixture after running `n` tests)"
         CustomBehavior.__init__(self, logger, fixture, description)
+        self.hook_test_case = testcases.TestCase(logger, "Hook", "CleanEveryN")
 
         # Try to isolate what test triggers the leak by restarting the fixture each time.
         if "detect_leaks=1" in os.getenv("ASAN_OPTIONS", ""):
@@ -117,48 +111,237 @@ class CleanEveryN(CustomBehavior):
 
     def after_test(self, test, test_report):
         self.tests_run += 1
-        if self.tests_run >= self.n:
+        if self.tests_run < self.n:
+            return
+
+        self.hook_test_case.test_name = test.short_name() + ":" + self.logger_name
+        CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
+        try:
             self.logger.info("%d tests have been run against the fixture, stopping it...",
                              self.tests_run)
             self.tests_run = 0
 
-            teardown_success = self.fixture.teardown()
+            if not self.fixture.teardown():
+                raise errors.ServerFailure("%s did not exit cleanly" % (self.fixture))
+
             self.logger.info("Starting the fixture back up again...")
             self.fixture.setup()
             self.fixture.await_ready()
 
-            # Raise this after calling setup in case --continueOnFailure was specified.
-            if not teardown_success:
-                raise errors.TestFailure("%s did not exit cleanly" % (self.fixture))
+            self.hook_test_case.return_code = 0
+            test_report.addSuccess(self.hook_test_case)
+        finally:
+            test_report.stopTest(self.hook_test_case)
 
 
 class JsCustomBehavior(CustomBehavior):
     def __init__(self, logger, fixture, js_filename, description, shell_options=None):
         CustomBehavior.__init__(self, logger, fixture, description)
         self.hook_test_case = testcases.JSTestCase(logger,
-                                              js_filename,
-                                              shell_options=shell_options,
-                                              test_kind="Hook")
+                                                   js_filename,
+                                                   shell_options=shell_options,
+                                                   test_kind="Hook")
+        self.test_case_is_configured = False
 
     def before_suite(self, test_report):
-        # Configure the test case after the fixture has been set up.
-        self.hook_test_case.configure(self.fixture)
+        if not self.test_case_is_configured:
+            # Configure the test case after the fixture has been set up.
+            self.hook_test_case.configure(self.fixture)
+            self.test_case_is_configured = True
+
+    def _should_run_after_test_impl(self):
+        return True
+
+    def _after_test_impl(self, test, test_report, description):
+        self.hook_test_case.run_test()
 
     def after_test(self, test, test_report):
+        if not self._should_run_after_test_impl():
+            return
+
+        # Change test_name and description to be more descriptive.
         description = "{0} after running '{1}'".format(self.description, test.short_name())
+        self.hook_test_case.test_name = test.short_name() + ":" + self.logger_name
+        CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
+
         try:
-            # Change test_name and description to be more descriptive.
-            self.hook_test_case.test_name = test.short_name() + ":" + self.logger_name
-            CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
-            self.hook_test_case.run_test()
-            self.hook_test_case.return_code = 0
-            test_report.addSuccess(self.hook_test_case)
+            self._after_test_impl(test, test_report, description)
+        except pymongo.errors.OperationFailure as err:
+            self.hook_test_case.logger.exception("{0} failed".format(description))
+            self.hook_test_case.return_code = 1
+            test_report.addFailure(self.hook_test_case, sys.exc_info())
+            raise errors.StopExecution(err.args[0])
         except self.hook_test_case.failureException as err:
             self.hook_test_case.logger.exception("{0} failed".format(description))
             test_report.addFailure(self.hook_test_case, sys.exc_info())
-            raise errors.TestFailure(err.args[0])
+            raise errors.StopExecution(err.args[0])
+        else:
+            self.hook_test_case.return_code = 0
+            test_report.addSuccess(self.hook_test_case)
         finally:
             test_report.stopTest(self.hook_test_case)
+
+
+class BackgroundInitialSync(JsCustomBehavior):
+    """
+    After every test, this hook checks if a background node has finished initial sync and if so,
+    validates it, tears it down, and restarts it.
+
+    This test accepts a parameter 'n' that specifies a number of tests after which it will wait for
+    replication to finish before validating and restarting the initial sync node. It also accepts
+    a parameter 'use_resync' for whether to restart the initial sync node with resync or by
+    shutting it down and restarting it.
+
+    This requires the ReplicaSetFixture to be started with 'start_initial_sync_node=True'. If used
+    at the same time as CleanEveryN, the 'n' value passed to this hook should be equal to the 'n'
+    value for CleanEveryN.
+    """
+
+    DEFAULT_N = CleanEveryN.DEFAULT_N
+
+    def __init__(self, logger, fixture, use_resync=False, n=DEFAULT_N, shell_options=None):
+        description = "Background Initial Sync"
+        js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description, shell_options)
+
+        self.use_resync = use_resync
+        self.n = n
+        self.tests_run = 0
+        self.random_restarts = 0
+
+    # Restarts initial sync by shutting down the node, clearing its data, and restarting it,
+    # or by calling resync if use_resync is specified.
+    def __restart_init_sync(self, test_report, sync_node, sync_node_conn):
+        if self.use_resync:
+            self.hook_test_case.logger.info("Calling resync on initial sync node...")
+            cmd = bson.SON([("resync", 1), ("wait", 0)])
+            sync_node_conn.admin.command(cmd)
+        else:
+            # Tear down and restart the initial sync node to start initial sync again.
+            if not sync_node.teardown():
+                raise errors.ServerFailure("%s did not exit cleanly" % (sync_node))
+
+            self.hook_test_case.logger.info("Starting the initial sync node back up again...")
+            sync_node.setup()
+            sync_node.await_ready()
+
+    def _after_test_impl(self, test, test_report, description):
+        self.tests_run += 1
+        sync_node = self.fixture.get_initial_sync_node()
+        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+
+        # If it's been 'n' tests so far, wait for the initial sync node to finish syncing.
+        if self.tests_run >= self.n:
+            self.hook_test_case.logger.info(
+                "%d tests have been run against the fixture, waiting for initial sync"
+                " node to go into SECONDARY state",
+                self.tests_run)
+            self.tests_run = 0
+
+            cmd = bson.SON([("replSetTest", 1),
+                            ("waitForMemberState", 2),
+                            ("timeoutMillis", 20 * 60 * 1000)])
+            sync_node_conn.admin.command(cmd)
+
+        # Check if the initial sync node is in SECONDARY state. If it's been 'n' tests, then it
+        # should have waited to be in SECONDARY state and the test should be marked as a failure.
+        # Otherwise, we just skip the hook and will check again after the next test.
+        try:
+            state = sync_node_conn.admin.command("replSetGetStatus").get("myState")
+            if state != 2:
+                if self.tests_run == 0:
+                    msg = "Initial sync node did not catch up after waiting 20 minutes"
+                    self.hook_test_case.logger.exception("{0} failed: {1}".format(description, msg))
+                    raise errors.TestFailure(msg)
+
+                self.hook_test_case.logger.info(
+                    "Initial sync node is in state %d, not state SECONDARY (2)."
+                    " Skipping BackgroundInitialSync hook for %s",
+                    state,
+                    test.short_name())
+
+                # If we have not restarted initial sync since the last time we ran the data
+                # validation, restart initial sync with a 20% probability.
+                if self.random_restarts < 1 and random.random() < 0.2:
+                    hook_type = "resync" if self.use_resync else "initial sync"
+                    self.hook_test_case.logger.info("randomly restarting " + hook_type +
+                                             " in the middle of " + hook_type)
+                    self.__restart_init_sync(test_report, sync_node, sync_node_conn)
+                    self.random_restarts += 1
+                return
+        except pymongo.errors.OperationFailure:
+            # replSetGetStatus can fail if the node is in STARTUP state. The node will soon go into
+            # STARTUP2 state and replSetGetStatus will succeed after the next test.
+            self.hook_test_case.logger.info(
+                "replSetGetStatus call failed in BackgroundInitialSync hook, skipping hook for %s",
+                test.short_name())
+            return
+
+        self.random_restarts = 0
+
+        # Run data validation and dbhash checking.
+        self.hook_test_case.run_test()
+
+        self.__restart_init_sync(test_report, sync_node, sync_node_conn)
+
+
+class IntermediateInitialSync(JsCustomBehavior):
+    """
+    This hook accepts a parameter 'n' that specifies a number of tests after which it will start up
+    a node to initial sync, wait for replication to finish, and then validate the data. It also
+    accepts a parameter 'use_resync' for whether to restart the initial sync node with resync or by
+    shutting it down and restarting it.
+
+    This requires the ReplicaSetFixture to be started with 'start_initial_sync_node=True'.
+    """
+
+    DEFAULT_N = CleanEveryN.DEFAULT_N
+
+    def __init__(self, logger, fixture, use_resync=False, n=DEFAULT_N):
+        description = "Intermediate Initial Sync"
+        js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+
+        self.use_resync = use_resync
+        self.n = n
+        self.tests_run = 0
+
+    def _should_run_after_test_impl(self):
+        self.tests_run += 1
+
+        # If we have not run 'n' tests yet, skip this hook.
+        if self.tests_run < self.n:
+            return False
+
+        self.tests_run = 0
+        return True
+
+    def _after_test_impl(self, test, test_report, description):
+        sync_node = self.fixture.get_initial_sync_node()
+        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+
+        if self.use_resync:
+            self.hook_test_case.logger.info("Calling resync on initial sync node...")
+            cmd = bson.SON([("resync", 1)])
+            sync_node_conn.admin.command(cmd)
+        else:
+            if not sync_node.teardown():
+                raise errors.ServerFailure("%s did not exit cleanly" % (sync_node))
+
+            self.hook_test_case.logger.info("Starting the initial sync node back up again...")
+            sync_node.setup()
+            sync_node.await_ready()
+
+        # Do initial sync round.
+        self.hook_test_case.logger.info("Waiting for initial sync node to go into SECONDARY state")
+        cmd = bson.SON([("replSetTest", 1),
+                        ("waitForMemberState", 2),
+                        ("timeoutMillis", 20 * 60 * 1000)])
+        sync_node_conn.admin.command(cmd)
+
+        # Run data validation and dbhash checking.
+        self.hook_test_case.run_test()
+
 
 
 class ValidateCollections(JsCustomBehavior):
@@ -166,10 +349,15 @@ class ValidateCollections(JsCustomBehavior):
     Runs full validation on all collections in all databases on every stand-alone
     node, primary replica-set node, or primary shard node.
     """
-    def __init__(self, logger, fixture):
+    def __init__(self, logger, fixture, shell_options=None):
         description = "Full collection validation"
         js_filename = os.path.join("jstests", "hooks", "run_validate_collections.js")
-        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
 
 class CheckReplDBHash(JsCustomBehavior):
@@ -177,509 +365,327 @@ class CheckReplDBHash(JsCustomBehavior):
     Checks that the dbhashes of all non-local databases and non-replicated system collections
     match on the primary and secondaries.
     """
-    def __init__(self, logger, fixture):
+    def __init__(self, logger, fixture, shell_options=None):
         description = "Check dbhashes of all replica set or master/slave members"
         js_filename = os.path.join("jstests", "hooks", "run_check_repl_dbhash.js")
-        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
 
-# Old version of CheckReplDBHash used to ensure feature parity of new version.
-class CheckReplDBHashDeprecated(CustomBehavior):
+class CheckReplOplogs(JsCustomBehavior):
     """
-    Waits for replication after each test, then checks that the dbhahses
-    of all databases other than "local" match on the primary and all of
-    the secondaries. If any dbhashes do not match, logs information
-    about what was different (e.g. Different numbers of collections,
-    missing documents in a collection, mismatching documents, etc).
+    Checks that local.oplog.rs matches on the primary and secondaries.
+    """
+    def __init__(self, logger, fixture, shell_options=None):
+        description = "Check oplogs of all replica set members"
+        js_filename = os.path.join("jstests", "hooks", "run_check_repl_oplogs.js")
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
-    Compatible only with ReplFixture subclasses.
+
+class PeriodicKillSecondaries(CustomBehavior):
+    """
+    Periodically kills the secondaries in a replica set and verifies
+    that they can reach the SECONDARY state without having connectivity
+    to the primary after an unclean shutdown.
     """
 
-    def __init__(self, logger, fixture):
-        if not isinstance(fixture, fixtures.ReplFixture):
-            raise TypeError("%s does not support replication" % (fixture.__class__.__name__))
+    DEFAULT_PERIOD_SECS = 30
 
-        description = "Check that replica-set nodes are consistent by using the dbHash command"
+    def __init__(self, logger, fixture, period_secs=DEFAULT_PERIOD_SECS):
+        if not isinstance(fixture, fixtures.ReplicaSetFixture):
+            raise TypeError("%s either does not support replication or does not support writing to"
+                            " its oplog early"
+                            % (fixture.__class__.__name__))
+
+        if fixture.num_nodes <= 1:
+            raise ValueError("PeriodicKillSecondaries requires the replica set to contain at least"
+                             " one secondary")
+
+        description = ("PeriodicKillSecondaries (kills the secondary after running tests for a"
+                       " configurable period of time)")
         CustomBehavior.__init__(self, logger, fixture, description)
 
-        self.started = False
-        self.hook_test_case = testcases.TestCase(self.logger, "Hook", self.logger_name)
-
-    def after_test(self, test, test_report):
-        """
-        After each test, check that the dbhash of the test database is
-        the same on all nodes in the replica set or master/slave
-        fixture.
-        """
-
-        try:
-            if not self.started:
-                CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
-                self.started = True
-
-            # Wait until all operations have replicated.
-            self.fixture.await_repl()
-
-            success = True
-            sb = []  # String builder.
-
-            primary = self.fixture.get_primary()
-            primary_conn = utils.new_mongo_client(port=primary.port)
-
-            for secondary in self.fixture.get_secondaries():
-                read_preference = pymongo.ReadPreference.SECONDARY
-                secondary_conn = utils.new_mongo_client(port=secondary.port,
-                                                        read_preference=read_preference)
-                # Skip arbiters.
-                if secondary_conn.admin.command("isMaster").get("arbiterOnly", False):
-                    continue
-
-                all_matched = CheckReplDBHashDeprecated._check_all_db_hashes(primary_conn,
-                                                                             secondary_conn,
-                                                                             sb)
-                if not all_matched:
-                    sb.insert(0,
-                              "One or more databases were different between the primary on port %d"
-                              " and the secondary on port %d:"
-                              % (primary.port, secondary.port))
-
-                success = all_matched and success
-
-            if not success:
-                CheckReplDBHashDeprecated._dump_oplog(primary_conn, secondary_conn, sb)
-
-                # Adding failures to a TestReport requires traceback information, so we raise
-                # a 'self.hook_test_case.failureException' that we will catch ourselves.
-                self.hook_test_case.logger.info("\n    ".join(sb))
-                raise self.hook_test_case.failureException("The dbhashes did not match")
-        except self.hook_test_case.failureException as err:
-            self.hook_test_case.logger.exception("The dbhashes did not match.")
-            self.hook_test_case.return_code = 1
-            test_report.addFailure(self.hook_test_case, sys.exc_info())
-            test_report.stopTest(self.hook_test_case)
-            raise errors.ServerFailure(err.args[0])
-        except pymongo.errors.WTimeoutError:
-            self.hook_test_case.logger.exception("Awaiting replication timed out.")
-            self.hook_test_case.return_code = 2
-            test_report.addError(self.hook_test_case, sys.exc_info())
-            test_report.stopTest(self.hook_test_case)
-            raise errors.StopExecution("Awaiting replication timed out")
+        self._period_secs = period_secs
+        self._start_time = None
 
     def after_suite(self, test_report):
-        """
-        If we get to this point, the #dbhash# test must have been
-        successful, so add it to the test report.
-        """
+        if self._start_time is not None:
+            # Ensure that we test killing the secondary and having it reach state SECONDARY after
+            # being restarted at least once when running the suite.
+            self._run(test_report)
 
-        if self.started:
-            self.hook_test_case.logger.info("The dbhashes matched for all tests.")
-            self.hook_test_case.return_code = 0
-            test_report.addSuccess(self.hook_test_case)
-            # TestReport.stopTest() has already been called if there was a failure.
-            test_report.stopTest(self.hook_test_case)
-
-        self.started = False
-
-    @staticmethod
-    def _dump_oplog(primary_conn, secondary_conn, sb):
-
-        def dump_latest_docs(coll, limit=0):
-            docs = (doc for doc in coll.find().sort("$natural", pymongo.DESCENDING).limit(limit))
-            for doc in docs:
-                sb.append("    %s" % (doc))
-
-        LIMIT = 100
-        sb.append("Dumping the latest %d documents from the primary's oplog" % (LIMIT))
-        dump_latest_docs(primary_conn.local.oplog.rs, LIMIT)
-        sb.append("Dumping the latest %d documents from the secondary's oplog" % (LIMIT))
-        dump_latest_docs(secondary_conn.local.oplog.rs, LIMIT)
-
-    @staticmethod
-    def _check_all_db_hashes(primary_conn, secondary_conn, sb):
-        """
-        Returns true if for each non-local database, the dbhash command
-        returns the same MD5 hash on the primary as it does on the
-        secondary. Returns false otherwise.
-
-        Logs a message describing the differences if any database's
-        dbhash did not match.
-        """
-
-        # Overview of how we'll check that everything replicated correctly between these two nodes:
-        #
-        # - Check whether they have the same databases.
-        #     - If not, log which databases are missing where, and dump the contents of any that are
-        #       missing.
-        #
-        # - Check whether each database besides "local" gives the same md5 field as the result of
-        #   running the dbhash command.
-        #     - If not, check whether they have the same collections.
-        #         - If not, log which collections are missing where, and dump the contents of any
-        #           that are missing.
-        #     - If so, check that the hash of each non-capped collection matches.
-        #         - If any do not match, log the diff of the collection between the two nodes.
-
-        success = True
-
-        if not CheckReplDBHashDeprecated._check_dbs_present(primary_conn, secondary_conn, sb):
-            return False
-
-        for db_name in primary_conn.database_names():
-            if db_name == "local":
-                continue  # We don't expect this to match across different nodes.
-
-            matched = CheckReplDBHashDeprecated._check_db_hash(
-                primary_conn, secondary_conn, db_name, sb)
-            success = matched and success
-
-        return success
-
-    @staticmethod
-    def _check_dbs_present(primary_conn, secondary_conn, sb):
-        """
-        Returns true if the list of databases on the primary is
-        identical to the list of databases on the secondary, and false
-        otherwise.
-        """
-
-        success = True
-        primary_dbs = primary_conn.database_names()
-
-        # Can't run database_names() on secondary, so instead use the listDatabases command.
-        # TODO: Use database_names() once PYTHON-921 is resolved.
-        list_db_output = secondary_conn.admin.command("listDatabases")
-        secondary_dbs = [db["name"] for db in list_db_output["databases"]]
-
-        # There may be a difference in databases which is not considered an error, when
-        # the database only contains system collections. This difference is only logged
-        # when others are encountered, i.e., success = False.
-        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
-            set(primary_dbs), set(secondary_dbs), "database")
-
-        for missing_db in missing_on_secondary:
-            db = primary_conn[missing_db]
-            coll_names = db.collection_names()
-            non_system_colls = [name for name in coll_names if not name.startswith("system.")]
-
-            # It is only an error if there are any non-system collections in the database,
-            # otherwise it's not well defined whether they should exist or not.
-            if non_system_colls:
-                sb.append("Database %s present on primary but not on secondary." % (missing_db))
-                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
-                success = False
-
-        for missing_db in missing_on_primary:
-            db = secondary_conn[missing_db]
-
-            # Can't run collection_names() on secondary, so instead use the listCollections command.
-            # TODO: Always use collection_names() once PYTHON-921 is resolved. Then much of the
-            # logic that is duplicated here can be consolidated.
-            list_coll_output = db.command("listCollections")["cursor"]["firstBatch"]
-            coll_names = [coll["name"] for coll in list_coll_output]
-            non_system_colls = [name for name in coll_names if not name.startswith("system.")]
-
-            # It is only an error if there are any non-system collections in the database,
-            # otherwise it's not well defined if it should exist or not.
-            if non_system_colls:
-                sb.append("Database %s present on secondary but not on primary." % (missing_db))
-                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
-                success = False
-
-        return success
-
-    @staticmethod
-    def _check_db_hash(primary_conn, secondary_conn, db_name, sb):
-        """
-        Returns true if the dbhash for 'db_name' matches on the primary
-        and the secondary, and false otherwise.
-
-        Appends a message to 'sb' describing the differences if the
-        dbhashes do not match.
-        """
-
-        primary_hash = primary_conn[db_name].command("dbhash")
-        secondary_hash = secondary_conn[db_name].command("dbhash")
-
-        if primary_hash["md5"] == secondary_hash["md5"]:
-            return True
-
-        success = CheckReplDBHashDeprecated._check_dbs_eq(
-            primary_conn, secondary_conn, primary_hash, secondary_hash, db_name, sb)
-
-        if not success:
-            sb.append("Database %s has a different hash on the primary and the secondary"
-                      " ([ %s ] != [ %s ]):"
-                      % (db_name, primary_hash["md5"], secondary_hash["md5"]))
-
-        return success
-
-    @staticmethod
-    def _check_dbs_eq(primary_conn, secondary_conn, primary_hash, secondary_hash, db_name, sb):
-        """
-        Returns true if all non-capped collections had the same hash in
-        the dbhash response, and false otherwise.
-
-        Appends information to 'sb' about the differences between the
-        'db_name' database on the primary and the 'db_name' database on
-        the secondary, if any.
-        """
-
-        success = True
-
-        primary_db = primary_conn[db_name]
-        secondary_db = secondary_conn[db_name]
-
-        primary_coll_hashes = primary_hash["collections"]
-        secondary_coll_hashes = secondary_hash["collections"]
-
-        primary_coll_names = set(primary_coll_hashes.keys())
-        secondary_coll_names = set(secondary_coll_hashes.keys())
-
-        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
-            primary_coll_names, secondary_coll_names, "collection", sb=sb)
-
-        if missing_on_primary or missing_on_secondary:
-
-            # 'sb' already describes which collections are missing where.
-            for coll_name in missing_on_primary:
-                CheckReplDBHashDeprecated._dump_all_documents(secondary_db, coll_name, sb)
-            for coll_name in missing_on_secondary:
-                CheckReplDBHashDeprecated._dump_all_documents(primary_db, coll_name, sb)
+    def before_test(self, test, test_report):
+        if self._start_time is not None:
+            # The "rsSyncApplyStop" failpoint is already enabled.
             return
 
-        for coll_name in primary_coll_names & secondary_coll_names:
-            primary_coll_hash = primary_coll_hashes[coll_name]
-            secondary_coll_hash = secondary_coll_hashes[coll_name]
+        # Enable the "rsSyncApplyStop" failpoint on each of the secondaries to prevent them from
+        # applying any oplog entries while the test is running.
+        for secondary in self.fixture.get_secondaries():
+            client = utils.new_mongo_client(port=secondary.port)
+            try:
+                client.admin.command(bson.SON([
+                    ("configureFailPoint", "rsSyncApplyStop"),
+                    ("mode", "alwaysOn")]))
+            except pymongo.errors.OperationFailure as err:
+                self.logger.exception(
+                    "Unable to disable oplog application on the mongod on port %d", secondary.port)
+                raise errors.ServerFailure(
+                    "Unable to disable oplog application on the mongod on port %d: %s"
+                    % (secondary.port, err.args[0]))
 
-            if primary_coll_hash == secondary_coll_hash:
-                continue
+        self._start_time = time.time()
 
-            # Ignore capped collections because they are not expected to match on all nodes.
-            if primary_db.command({"collStats": coll_name})["capped"]:
-                # Still fail if the collection is not capped on the secondary.
-                if not secondary_db.command({"collStats": coll_name})["capped"]:
-                    success = False
-                    sb.append("%s.%s collection is capped on primary but not on secondary."
-                              % (primary_db.name, coll_name))
-                sb.append("%s.%s collection is capped, ignoring." % (primary_db.name, coll_name))
-                continue
-            # Still fail if the collection is capped on the secondary, but not on the primary.
-            elif secondary_db.command({"collStats": coll_name})["capped"]:
-                success = False
-                sb.append("%s.%s collection is capped on secondary but not on primary."
-                          % (primary_db.name, coll_name))
-                continue
+    def after_test(self, test, test_report):
+        self._last_test_name = test.short_name()
 
-            success = False
-            sb.append("Collection %s.%s has a different hash on the primary and the secondary"
-                      " ([ %s ] != [ %s ]):"
-                      % (db_name, coll_name, primary_coll_hash, secondary_coll_hash))
-            CheckReplDBHashDeprecated._check_colls_eq(primary_db, secondary_db, coll_name, sb)
+        # Kill the secondaries and verify that they can reach the SECONDARY state if the specified
+        # period has elapsed.
+        should_check_secondaries = time.time() - self._start_time >= self._period_secs
+        if not should_check_secondaries:
+            return
 
-        if success:
-            sb.append("All collections that were expected to match did.")
-        return success
+        self._run(test_report)
 
-    @staticmethod
-    def _check_colls_eq(primary_db, secondary_db, coll_name, sb):
-        """
-        Appends information to 'sb' about the differences or between
-        the 'coll_name' collection on the primary and the 'coll_name'
-        collection on the secondary, if any.
-        """
+    def _run(self, test_report):
+        self.hook_test_case = testcases.TestCase(
+            self.logger,
+            "Hook",
+            "%s:%s" % (self._last_test_name, self.logger_name))
+        CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
 
-        codec_options = bson.CodecOptions(document_class=TypeSensitiveSON)
+        try:
+            self._kill_secondaries()
+            self._check_secondaries_and_restart_fixture()
 
-        primary_coll = primary_db.get_collection(coll_name, codec_options=codec_options)
-        secondary_coll = secondary_db.get_collection(coll_name, codec_options=codec_options)
+            # Validate all collections on all nodes after having the secondaries reconcile the end
+            # of their oplogs.
+            self._validate_collections(test_report)
 
-        primary_docs = CheckReplDBHashDeprecated._extract_documents(primary_coll)
-        secondary_docs = CheckReplDBHashDeprecated._extract_documents(secondary_coll)
+            # Verify that the dbhashes match across all nodes after having the secondaries reconcile
+            # the end of their oplogs.
+            self._check_repl_dbhash(test_report)
 
-        CheckReplDBHashDeprecated._get_collection_diff(primary_docs, secondary_docs, sb)
-
-    @staticmethod
-    def _extract_documents(collection):
-        """
-        Returns a list of all documents in the collection, sorted by
-        their _id.
-        """
-
-        return [doc for doc in collection.find().sort("_id", pymongo.ASCENDING)]
-
-    @staticmethod
-    def _get_collection_diff(primary_docs, secondary_docs, sb):
-        """
-        Returns true if the documents in 'primary_docs' exactly match
-        the documents in 'secondary_docs', and false otherwise.
-
-        Appends information to 'sb' about what matched or did not match.
-        """
-
-        matched = True
-
-        # These need to be lists instead of sets because documents aren't hashable.
-        missing_on_primary = []
-        missing_on_secondary = []
-
-        p_idx = 0  # Keep track of our position in 'primary_docs'.
-        s_idx = 0  # Keep track of our position in 'secondary_docs'.
-
-        while p_idx < len(primary_docs) and s_idx < len(secondary_docs):
-            primary_doc = primary_docs[p_idx]
-            secondary_doc = secondary_docs[s_idx]
-
-            if primary_doc == secondary_doc:
-                p_idx += 1
-                s_idx += 1
-                continue
-
-            # We have mismatching documents.
-            matched = False
-
-            if primary_doc["_id"] == secondary_doc["_id"]:
-                sb.append("Mismatching document:")
-                sb.append("    primary:   %s" % (primary_doc))
-                sb.append("    secondary: %s" % (secondary_doc))
-                p_idx += 1
-                s_idx += 1
-
-            # One node was missing a document. Since the documents are sorted by _id, the doc with
-            # the smaller _id was the one that was skipped.
-            elif primary_doc["_id"] < secondary_doc["_id"]:
-                missing_on_secondary.append(primary_doc)
-
-                # Only move past the doc that we know was skipped.
-                p_idx += 1
-
-            else:  # primary_doc["_id"] > secondary_doc["_id"]
-                missing_on_primary.append(secondary_doc)
-
-                # Only move past the doc that we know was skipped.
-                s_idx += 1
-
-        # Check if there are any unmatched documents left.
-        while p_idx < len(primary_docs):
-            matched = False
-            missing_on_secondary.append(primary_docs[p_idx])
-            p_idx += 1
-        while s_idx < len(secondary_docs):
-            matched = False
-            missing_on_primary.append(secondary_docs[s_idx])
-            s_idx += 1
-
-        if not matched:
-            CheckReplDBHashDeprecated._append_differences(
-                missing_on_primary, missing_on_secondary, "document", sb)
+            self._restart_and_clear_fixture()
+        except Exception as err:
+            self.hook_test_case.logger.exception(
+                "Encountered an error running PeriodicKillSecondaries.")
+            self.hook_test_case.return_code = 2
+            test_report.addFailure(self.hook_test_case, sys.exc_info())
+            raise errors.StopExecution(err.args[0])
         else:
-            sb.append("All documents matched.")
+            self.hook_test_case.return_code = 0
+            test_report.addSuccess(self.hook_test_case)
+        finally:
+            test_report.stopTest(self.hook_test_case)
 
-    @staticmethod
-    def _check_difference(primary_set, secondary_set, item_type_name, sb=None):
-        """
-        Returns true if the contents of 'primary_set' and
-        'secondary_set' are identical, and false otherwise. The sets
-        contain information about the primary and secondary,
-        respectively, e.g. the database names that exist on each node.
+            # Set the hook back into a state where it will disable oplog application at the start
+            # of the next test that runs.
+            self._start_time = None
 
-        Appends information about anything that differed to 'sb'.
-        """
+    def _kill_secondaries(self):
+        for secondary in self.fixture.get_secondaries():
+            # Disable the "rsSyncApplyStop" failpoint on the secondary to have it resume applying
+            # oplog entries.
+            for secondary in self.fixture.get_secondaries():
+                client = utils.new_mongo_client(port=secondary.port)
+                try:
+                    client.admin.command(bson.SON([
+                        ("configureFailPoint", "rsSyncApplyStop"),
+                        ("mode", "off")]))
+                except pymongo.errors.OperationFailure as err:
+                    self.logger.exception(
+                        "Unable to re-enable oplog application on the mongod on port %d",
+                        secondary.port)
+                    raise errors.ServerFailure(
+                        "Unable to re-enable oplog application on the mongod on port %d: %s"
+                        % (secondary.port, err.args[0]))
 
-        missing_on_primary = set()
-        missing_on_secondary = set()
+            # Wait a little bit for the secondary to start apply oplog entries so that we are more
+            # likely to kill the mongod process while it is partway into applying a batch.
+            time.sleep(0.1)
 
-        for item in primary_set - secondary_set:
-            missing_on_secondary.add(item)
+            # Check that the secondary is still running before forcibly terminating it. This ensures
+            # we still detect some cases in which the secondary has already crashed.
+            if not secondary.is_running():
+                raise errors.ServerFailure(
+                    "mongod on port %d was expected to be running in"
+                    " PeriodicKillSecondaries.after_test(), but wasn't."
+                    % (secondary.port))
 
-        for item in secondary_set - primary_set:
-            missing_on_primary.add(item)
+            self.hook_test_case.logger.info(
+                "Killing the secondary on port %d..." % (secondary.port))
+            secondary.mongod.stop(kill=True)
 
-        if sb is not None:
-            CheckReplDBHashDeprecated._append_differences(
-                missing_on_primary, missing_on_secondary, item_type_name, sb)
+        # Teardown may or may not be considered a success as a result of killing a secondary, so we
+        # ignore the return value of Fixture.teardown().
+        self.fixture.teardown()
 
-        return (missing_on_primary, missing_on_secondary)
+    def _check_secondaries_and_restart_fixture(self):
+        preserve_dbpaths = []
+        for node in self.fixture.nodes:
+            preserve_dbpaths.append(node.preserve_dbpath)
+            node.preserve_dbpath = True
 
-    @staticmethod
-    def _append_differences(missing_on_primary, missing_on_secondary, item_type_name, sb):
-        """
-        Given two iterables representing items that were missing on the
-        primary or the secondary respectively, append the information
-        about which items were missing to 'sb', if any.
-        """
+        for secondary in self.fixture.get_secondaries():
+            self._check_invariants_as_standalone(secondary)
 
-        if missing_on_primary:
-            sb.append("The following %ss were present on the secondary, but not on the"
-                      " primary:" % (item_type_name))
-            for item in missing_on_primary:
-                sb.append(str(item))
+            # Start the 'secondary' mongod back up as part of the replica set and wait for it to
+            # reach state SECONDARY.
+            secondary.setup()
+            secondary.await_ready()
+            self._await_secondary_state(secondary)
 
-        if missing_on_secondary:
-            sb.append("The following %ss were present on the primary, but not on the"
-                      " secondary:" % (item_type_name))
-            for item in missing_on_secondary:
-                sb.append(str(item))
+            teardown_success = secondary.teardown()
+            if not teardown_success:
+                raise errors.ServerFailure(
+                    "%s did not exit cleanly after reconciling the end of its oplog" % (secondary))
 
-    @staticmethod
-    def _dump_all_collections(database, coll_names, sb):
-        """
-        Appends the contents of each of the collections in 'coll_names'
-        to 'sb'.
-        """
+        self.hook_test_case.logger.info(
+            "Starting the fixture back up again with its data files intact...")
 
-        if coll_names:
-            sb.append("Database %s contains the following collections: %s"
-                      % (database.name, coll_names))
-            for coll_name in coll_names:
-                CheckReplDBHashDeprecated._dump_all_documents(database, coll_name, sb)
-        else:
-            sb.append("No collections in database %s." % (database.name))
+        try:
+            self.fixture.setup()
+            self.fixture.await_ready()
+        finally:
+            for (i, node) in enumerate(self.fixture.nodes):
+                node.preserve_dbpath = preserve_dbpaths[i]
 
-    @staticmethod
-    def _dump_all_documents(database, coll_name, sb):
-        """
-        Appends the contents of 'coll_name' to 'sb'.
-        """
+    def _validate_collections(self, test_report):
+        validate_test_case = ValidateCollections(self.logger, self.fixture)
+        validate_test_case.before_suite(test_report)
+        validate_test_case.before_test(self.hook_test_case, test_report)
+        validate_test_case.after_test(self.hook_test_case, test_report)
+        validate_test_case.after_suite(test_report)
 
-        docs = CheckReplDBHashDeprecated._extract_documents(database[coll_name])
-        if docs:
-            sb.append("Documents in %s.%s:" % (database.name, coll_name))
-            for doc in docs:
-                sb.append("    %s" % (doc))
-        else:
-            sb.append("No documents in %s.%s." % (database.name, coll_name))
+    def _check_repl_dbhash(self, test_report):
+        dbhash_test_case = CheckReplDBHash(self.logger, self.fixture)
+        dbhash_test_case.before_suite(test_report)
+        dbhash_test_case.before_test(self.hook_test_case, test_report)
+        dbhash_test_case.after_test(self.hook_test_case, test_report)
+        dbhash_test_case.after_suite(test_report)
 
-class TypeSensitiveSON(bson.SON):
-    """
-    Extends bson.SON to perform additional type-checking of document values
-    to differentiate BSON types.
-    """
+    def _restart_and_clear_fixture(self):
+        # We restart the fixture after setting 'preserve_dbpath' back to its original value in order
+        # to clear the contents of the data directory if desired. The CleanEveryN hook cannot be
+        # used in combination with the PeriodicKillSecondaries hook because we may attempt to call
+        # Fixture.teardown() while the "rsSyncApplyStop" failpoint is still enabled on the
+        # secondaries, causing them to exit with a non-zero return code.
+        self.hook_test_case.logger.info(
+            "Finished verifying data consistency, stopping the fixture...")
 
-    def items_with_types(self):
-        """
-        Returns a list of triples. Each triple consists of a field name, a
-        field value, and a field type for each field in the document.
-        """
+        teardown_success = self.fixture.teardown()
+        if not teardown_success:
+            raise errors.ServerFailure(
+                "%s did not exit cleanly after verifying data consistency"
+                % (self.fixture))
 
-        return [(key, self[key], type(self[key])) for key in self]
+        self.hook_test_case.logger.info("Starting the fixture back up again...")
+        self.fixture.setup()
+        self.fixture.await_ready()
 
-    def __eq__(self, other):
-        """
-        Comparison to another TypeSensitiveSON is order-sensitive and
-        type-sensitive while comparison to a regular dictionary ignores order
-        and type mismatches.
-        """
+    def _check_invariants_as_standalone(self, secondary):
+        # We remove the --replSet option in order to start the node as a standalone.
+        replset_name = secondary.mongod_options.pop("replSet")
 
-        if isinstance(other, TypeSensitiveSON):
-            return (len(self) == len(other) and
-                    self.items_with_types() == other.items_with_types())
+        try:
+            secondary.setup()
+            secondary.await_ready()
 
-        raise TypeError("TypeSensitiveSON objects cannot be compared to other types")
+            client = utils.new_mongo_client(port=secondary.port)
+            minvalid_doc = client.local["replset.minvalid"].find_one()
+
+            latest_oplog_doc = client.local["oplog.rs"].find_one(
+                sort=[("$natural", pymongo.DESCENDING)])
+
+            if minvalid_doc is not None:
+                # Check the invariants 'begin <= minValid', 'minValid <= oplogDeletePoint', and
+                # 'minValid <= top of oplog' before the secondary has reconciled the end of its
+                # oplog.
+                null_ts = bson.Timestamp(0, 0)
+                begin_ts = minvalid_doc.get("begin", {}).get("ts", null_ts)
+                minvalid_ts = minvalid_doc.get("ts", begin_ts)
+                oplog_delete_point_ts = minvalid_doc.get("oplogDeleteFromPoint", minvalid_ts)
+
+                if minvalid_ts == null_ts:
+                    # The server treats the "ts" field in the minValid document as missing when its
+                    # value is the null timestamp.
+                    minvalid_ts = begin_ts
+
+                if oplog_delete_point_ts == null_ts:
+                    # The server treats the "oplogDeleteFromPoint" field as missing when its value
+                    # is the null timestamp.
+                    oplog_delete_point_ts = minvalid_ts
+
+                latest_oplog_entry_ts = latest_oplog_doc.get("ts", oplog_delete_point_ts)
+
+                if not begin_ts <= minvalid_ts:
+                    raise errors.ServerFailure(
+                        "The condition begin <= minValid (%s <= %s) doesn't hold: minValid"
+                        " document=%s, latest oplog entry=%s"
+                        % (begin_ts, minvalid_ts, minvalid_doc, latest_oplog_doc))
+
+                if not minvalid_ts <= oplog_delete_point_ts:
+                    raise errors.ServerFailure(
+                        "The condition minValid <= oplogDeletePoint (%s <= %s) doesn't hold:"
+                        " minValid document=%s, latest oplog entry=%s"
+                        % (minvalid_ts, oplog_delete_point_ts, minvalid_doc, latest_oplog_doc))
+
+                if not minvalid_ts <= latest_oplog_entry_ts:
+                    raise errors.ServerFailure(
+                        "The condition minValid <= top of oplog (%s <= %s) doesn't hold: minValid"
+                        " document=%s, latest oplog entry=%s"
+                        % (minvalid_ts, latest_oplog_entry_ts, minvalid_doc, latest_oplog_doc))
+
+            teardown_success = secondary.teardown()
+            if not teardown_success:
+                raise errors.ServerFailure(
+                    "%s did not exit cleanly after being started up as a standalone" % (secondary))
+        except pymongo.errors.OperationFailure as err:
+            self.hook_test_case.logger.exception(
+                "Failed to read the minValid document or the latest oplog entry from the mongod on"
+                " port %d",
+                secondary.port)
+            raise errors.ServerFailure(
+                "Failed to read the minValid document or the latest oplog entry from the mongod on"
+                " port %d: %s"
+                % (secondary.port, err.args[0]))
+        finally:
+            # Set the secondary's options back to their original values.
+            secondary.mongod_options["replSet"] = replset_name
+
+    def _await_secondary_state(self, secondary):
+        client = utils.new_mongo_client(port=secondary.port)
+        try:
+            client.admin.command(bson.SON([
+                ("replSetTest", 1),
+                ("waitForMemberState", 2),  # 2 = SECONDARY
+                ("timeoutMillis", fixtures.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60 * 1000)]))
+        except pymongo.errors.OperationFailure as err:
+            self.hook_test_case.logger.exception(
+                "mongod on port %d failed to reach state SECONDARY after %d seconds",
+                secondary.port,
+                fixtures.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60)
+            raise errors.ServerFailure(
+                "mongod on port %d failed to reach state SECONDARY after %d seconds: %s"
+                % (secondary.port, fixtures.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60, err.args[0]))
 
 
 _CUSTOM_BEHAVIORS = {
     "CleanEveryN": CleanEveryN,
     "CheckReplDBHash": CheckReplDBHash,
-    "CheckReplDBHashDeprecated": CheckReplDBHashDeprecated,
+    "CheckReplOplogs": CheckReplOplogs,
     "ValidateCollections": ValidateCollections,
+    "IntermediateInitialSync": IntermediateInitialSync,
+    "BackgroundInitialSync": BackgroundInitialSync,
+    "PeriodicKillSecondaries": PeriodicKillSecondaries,
 }

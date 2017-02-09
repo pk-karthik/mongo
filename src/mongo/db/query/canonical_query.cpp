@@ -36,6 +36,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/indexability.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/util/log.h"
 
@@ -249,7 +250,7 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
                 if (elt.Obj().firstElementFieldName()[0] == '$') {
                     return false;
                 }
-            } else if (!elt.isSimpleType() && BinData != elt.type()) {
+            } else if (!Indexability::isExactBoundsGenerating(elt)) {
                 // The _id fild cannot be something like { _id : { $gt : ...
                 // But it can be BinData.
                 return false;
@@ -268,11 +269,8 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
 
 // static
 MatchExpression* CanonicalQuery::normalizeTree(MatchExpression* root) {
-    // root->isLogical() is true now.  We care about AND, OR, and NOT. NOR currently scares us.
     if (MatchExpression::AND == root->matchType() || MatchExpression::OR == root->matchType()) {
-        // We could have AND of AND of AND.  Make sure we clean up our children before merging
-        // them.
-        // UNITTEST 11738048
+        // We could have AND of AND of AND.  Make sure we clean up our children before merging them.
         for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
             (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
         }
@@ -308,6 +306,27 @@ MatchExpression* CanonicalQuery::normalizeTree(MatchExpression* root) {
             root->getChildVector()->clear();
             delete root;
             return ret;
+        }
+    } else if (MatchExpression::NOR == root->matchType()) {
+        // First clean up children.
+        for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
+            (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
+        }
+
+        // NOR of one thing is NOT of the thing.
+        if (1 == root->numChildren()) {
+            // Detach the child and assume ownership.
+            std::unique_ptr<MatchExpression> child(root->getChild(0));
+            root->getChildVector()->clear();
+
+            // Delete the root when this goes out of scope.
+            std::unique_ptr<NorMatchExpression> ownedRoot(static_cast<NorMatchExpression*>(root));
+
+            // Make a NOT to be the new root and transfer ownership of the child to it.
+            auto newRoot = stdx::make_unique<NotMatchExpression>();
+            newRoot->init(child.release());
+
+            return newRoot.release();
         }
     } else if (MatchExpression::NOT == root->matchType()) {
         // Normalize the rest of the tree hanging off this NOT node.

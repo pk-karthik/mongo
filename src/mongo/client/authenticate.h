@@ -43,7 +43,7 @@ class BSONObj;
 
 namespace auth {
 
-using AuthResponse = StatusWith<executor::RemoteCommandResponse>;
+using AuthResponse = executor::RemoteCommandResponse;
 using AuthCompletionHandler = stdx::function<void(AuthResponse)>;
 using RunCommandResultHandler = AuthCompletionHandler;
 using RunCommandHook =
@@ -92,7 +92,7 @@ extern const char* const kMechanismScramSha1;
  * tantamount to authentication failure, but may also indicate more serious problems.
  */
 void authenticateClient(const BSONObj& params,
-                        StringData hostname,
+                        const HostAndPort& hostname,
                         StringData clientSubjectName,
                         RunCommandHook runCommand,
                         AuthCompletionHandler handler = AuthCompletionHandler());

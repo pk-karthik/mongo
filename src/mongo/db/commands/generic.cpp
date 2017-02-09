@@ -42,7 +42,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/shutdown.h"
 #include "mongo/db/db.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -95,7 +94,7 @@ public:
              int,  // options
              std::string& errmsg,
              BSONObjBuilder& result) {
-        appendBuildInfo(result);
+        VersionInfoInterface::instance().appendBuildInfo(&result);
         appendStorageEngineList(&result);
         return true;
     }
@@ -151,9 +150,9 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        if (globalScriptEngine) {
+        if (getGlobalScriptEngine()) {
             BSONObjBuilder bb(result.subobjStart("js"));
-            result.append("utf8", globalScriptEngine->utf8Ok());
+            result.append("utf8", getGlobalScriptEngine()->utf8Ok());
             bb.done();
         }
         if (cmdObj["oidReset"].trueValue()) {
@@ -311,7 +310,7 @@ public:
 namespace {
 MONGO_FP_DECLARE(crashOnShutdown);
 
-int* volatile illegalAddress;
+int* volatile illegalAddress;  // NOLINT - used for fail point only
 }  // namespace
 
 void CmdShutdown::addRequiredPrivileges(const std::string& dbname,

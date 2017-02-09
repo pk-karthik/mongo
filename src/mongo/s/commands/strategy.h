@@ -36,10 +36,10 @@
 
 namespace mongo {
 
+class DbMessage;
+class NamespaceString;
 class OperationContext;
-class QueryMessage;
 class QueryRequest;
-class Request;
 
 namespace rpc {
 class ServerSelectionMetadata;
@@ -50,13 +50,41 @@ class ServerSelectionMetadata;
  */
 class Strategy {
 public:
-    static void queryOp(OperationContext* txn, Request& request);
+    /**
+     * Handles a legacy-style opQuery request and sends the response back on success or throws on
+     * error.
+     *
+     * Must not be called with legacy '.$cmd' commands.
+     */
+    static void queryOp(OperationContext* txn, const NamespaceString& nss, DbMessage* dbm);
 
-    static void getMore(OperationContext* txn, Request& request);
+    /**
+     * Handles a legacy-style getMore request and sends the response back on success (or cursor not
+     * found) or throws on error.
+     */
+    static void getMore(OperationContext* txn, const NamespaceString& nss, DbMessage* dbm);
 
-    static void killCursors(OperationContext* txn, Request& request);
+    /**
+     * Handles a legacy-style killCursors request. Doesn't send any response on success or throws on
+     * error.
+     */
+    static void killCursors(OperationContext* txn, DbMessage* dbm);
 
-    static void writeOp(OperationContext* txn, int op, Request& request);
+    /**
+     * Handles a legacy-style write operation request and updates the last error state on the client
+     * with the result from the operation. Doesn't send any response back and does not throw on
+     * errors.
+     */
+    static void writeOp(OperationContext* txn, DbMessage* dbm);
+
+    /**
+     * Executes a legacy-style ($cmd namespace) command. Does not throw and returns the response
+     * regardless of success or error.
+     *
+     * Catches StaleConfigException errors and retries the command automatically after refreshing
+     * the metadata for the failing namespace.
+     */
+    static void clientCommandOp(OperationContext* txn, const NamespaceString& nss, DbMessage* dbm);
 
     /**
      * Helper to run an explain of a find operation on the shards. Fills 'out' with the result of
@@ -81,7 +109,8 @@ public:
 
     /**
      * Executes a command against a particular database, and targets the command based on a
-     * collection in that database.
+     * collection in that database, according to 'targetingQuery' and 'targetingCollation'. If
+     * 'targetingCollation' is empty, the collection default collation is used for targeting.
      *
      * This version should be used by internal commands when possible.
      *
@@ -94,17 +123,8 @@ public:
                           int options,
                           const std::string& versionedNS,
                           const BSONObj& targetingQuery,
+                          const BSONObj& targetingCollation,
                           std::vector<CommandResult>* results);
-
-    /**
-     * Executes a command represented in the Request on the sharded cluster.
-     *
-     * DEPRECATED: should not be used by new code.
-     */
-    static void clientCommandOp(OperationContext* txn, Request& request);
-
-protected:
-    static bool handleSpecialNamespaces(OperationContext* txn, Request& request, QueryMessage& q);
 };
 
 }  // namespace mongo

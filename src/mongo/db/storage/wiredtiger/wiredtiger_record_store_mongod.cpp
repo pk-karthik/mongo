@@ -34,6 +34,7 @@
 #include <set>
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -116,7 +117,7 @@ public:
     virtual void run() {
         Client::initThread(_name.c_str());
 
-        while (!inShutdown()) {
+        while (!globalInShutdownDeprecated()) {
             if (!_deleteExcessDocuments()) {
                 sleepmillis(1000);  // Back off in case there were problems deleting.
             }
@@ -128,10 +129,7 @@ private:
     std::string _name;
 };
 
-}  // namespace
-
-// static
-bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
+bool initRsOplogBackgroundThread(StringData ns) {
     if (!NamespaceString::oplog(ns)) {
         return false;
     }
@@ -155,4 +153,10 @@ bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
     return true;
 }
 
+MONGO_INITIALIZER(SetInitRsOplogBackgroundThreadCallback)(InitializerContext* context) {
+    WiredTigerKVEngine::setInitRsOplogBackgroundThreadCallback(initRsOplogBackgroundThread);
+    return Status::OK();
+}
+
+}  // namespace
 }  // namespace mongo

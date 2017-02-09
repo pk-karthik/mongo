@@ -90,8 +90,9 @@ private:
 };
 
 void FreshnessCheckerTest::setUp() {
-    _net = new NetworkInterfaceMock;
-    _executor = stdx::make_unique<ReplicationExecutor>(_net, 1 /* prng seed */);
+    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    _net = net.get();
+    _executor = stdx::make_unique<ReplicationExecutor>(std::move(net), 1 /* prng seed */);
     _executorThread.reset(new stdx::thread(stdx::bind(&ReplicationExecutor::run, _executor.get())));
     _checker.reset(new FreshnessChecker);
 }
@@ -181,7 +182,7 @@ TEST_F(FreshnessCheckerTest, TwoNodes) {
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
         _net->scheduleResponse(
             noi,
@@ -252,7 +253,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshest) {
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
         _net->scheduleResponse(
             noi,
@@ -277,7 +278,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshest) {
 
     stopCapturingLogMessages();
     ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
-    ASSERT_EQUALS(1, countLogLinesContaining("not electing self, we are not freshest"));
+    ASSERT_EQUALS(
+        1, countLogLinesContaining("not electing self, h1:27017 knows a node is fresher than us"));
 }
 
 TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTime) {
@@ -304,7 +306,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTime) {
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
         _net->scheduleResponse(
             noi,
@@ -354,7 +356,7 @@ TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponse) {
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
         _net->scheduleResponse(
             noi,
@@ -407,7 +409,7 @@ TEST_F(FreshnessCheckerTest, ElectVetoed) {
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
         _net->scheduleResponse(
             noi,
@@ -482,7 +484,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestManyNodes) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1 << "id" << findIdForMember(config, target) << "set"
@@ -503,7 +505,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestManyNodes) {
     waitOnChecker();
     stopCapturingLogMessages();
     ASSERT_EQUALS(shouldAbortElection(), FreshnessChecker::FresherNodeFound);
-    ASSERT_EQUALS(1, countLogLinesContaining("not electing self, we are not freshest"));
+    ASSERT_EQUALS(
+        1, countLogLinesContaining("not electing self, h1:27017 knows a node is fresher than us"));
 }
 
 TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTimeManyNodes) {
@@ -545,7 +548,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTimeManyNodes
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         BSONObjBuilder responseBuilder;
         if (target.host() == "h4") {
@@ -614,7 +617,7 @@ TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponseManyNodes) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1 << "id" << findIdForMember(config, target) << "set"
@@ -676,7 +679,7 @@ TEST_F(FreshnessCheckerTest, ElectVetoedManyNodes) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1 << "id" << findIdForMember(config, target) << "set"
@@ -742,7 +745,7 @@ TEST_F(FreshnessCheckerTest, ElectVetoedAndTiedFreshnessManyNodes) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         BSONObjBuilder responseBuilder;
         if (target.host() == "h4") {
@@ -817,7 +820,7 @@ TEST_F(FreshnessCheckerTest, ElectManyNodesNotAllRespond) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
         const HostAndPort target = noi->getRequest().target;
         ASSERT_EQUALS("admin", noi->getRequest().dbname);
-        ASSERT_EQUALS(freshRequest, noi->getRequest().cmdObj);
+        ASSERT_BSONOBJ_EQ(freshRequest, noi->getRequest().cmdObj);
         ASSERT(seen.insert(target).second) << "Already saw " << target;
         if (target.host() == "h2" || target.host() == "h3") {
             _net->scheduleResponse(noi,
@@ -947,6 +950,7 @@ protected:
         return RemoteCommandRequest(HostAndPort(hostname),
                                     "",  // the non-hostname fields do not matter in Freshness
                                     BSONObj(),
+                                    nullptr,
                                     Milliseconds(0));
     }
 

@@ -33,12 +33,13 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregation_request.h"
 
 namespace mongo {
 class Collection;
 class DocumentSourceCursor;
 class DocumentSourceSort;
-struct ExpressionContext;
+class ExpressionContext;
 class OperationContext;
 class Pipeline;
 class PlanExecutor;
@@ -70,20 +71,13 @@ public:
      *
      * The cursor is added to the front of the pipeline's sources.
      *
-     * Must have a AutoGetCollectionForRead before entering.
+     * Callers must take care to ensure that 'collection' is locked in at least IS-mode.
      *
-     * If the returned PlanExecutor is non-null, you are responsible for ensuring
-     * it receives appropriate invalidate and kill messages.
-     *
-     * @param pPipeline the logical "this" for this operation
-     * @param pExpCtx the expression context for this pipeline
+     * When not null, 'aggRequest' provides access to pipeline command options such as hint.
      */
-    static std::shared_ptr<PlanExecutor> prepareCursorSource(
-        OperationContext* txn,
-        Collection* collection,
-        const NamespaceString& nss,
-        const boost::intrusive_ptr<Pipeline>& pPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    static void prepareCursorSource(Collection* collection,
+                                    const AggregationRequest* aggRequest,
+                                    const boost::intrusive_ptr<Pipeline>& pipeline);
 
     static std::string getPlanSummaryStr(const boost::intrusive_ptr<Pipeline>& pPipeline);
 
@@ -102,7 +96,7 @@ private:
      * sort, and 'projectionObj' will be set to an empty object if the query system cannot provide a
      * covered projection.
      */
-    static std::shared_ptr<PlanExecutor> prepareExecutor(
+    static StatusWith<std::unique_ptr<PlanExecutor>> prepareExecutor(
         OperationContext* txn,
         Collection* collection,
         const NamespaceString& nss,
@@ -111,6 +105,7 @@ private:
         const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
         const DepsTracker& deps,
         const BSONObj& queryObj,
+        const AggregationRequest* aggRequest,
         BSONObj* sortObj,
         BSONObj* projectionObj);
 
@@ -118,14 +113,14 @@ private:
      * Creates a DocumentSourceCursor from the given PlanExecutor and adds it to the front of the
      * Pipeline.
      */
-    static std::shared_ptr<PlanExecutor> addCursorSource(
-        const boost::intrusive_ptr<Pipeline>& pipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        std::shared_ptr<PlanExecutor> exec,
-        DepsTracker deps,
-        const BSONObj& queryObj = BSONObj(),
-        const BSONObj& sortObj = BSONObj(),
-        const BSONObj& projectionObj = BSONObj());
+    static void addCursorSource(Collection* collection,
+                                const boost::intrusive_ptr<Pipeline>& pipeline,
+                                const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                std::unique_ptr<PlanExecutor> exec,
+                                DepsTracker deps,
+                                const BSONObj& queryObj = BSONObj(),
+                                const BSONObj& sortObj = BSONObj(),
+                                const BSONObj& projectionObj = BSONObj());
 };
 
 }  // namespace mongo

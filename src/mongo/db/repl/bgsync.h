@@ -54,17 +54,12 @@ namespace repl {
 class ReplicationCoordinator;
 class ReplicationCoordinatorExternalState;
 
-/**
- * Lock order:
- * 1. rslock
- * 2. rwlock
- * 3. BackgroundSync::_mutex
- */
 class BackgroundSync {
+    MONGO_DISALLOW_COPYING(BackgroundSync);
+
 public:
     BackgroundSync(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
                    std::unique_ptr<OplogBuffer> oplogBuffer);
-    MONGO_DISALLOW_COPYING(BackgroundSync);
 
     // stop syncing (when this node becomes a primary, e.g.)
     void stop();
@@ -86,6 +81,7 @@ public:
 
     /**
      * Returns true if shutdown() has been called.
+     * Once this returns true, nothing more will be added to the queue and consumers must shutdown.
      */
     bool inShutdown() const;
 
@@ -101,7 +97,7 @@ public:
     bool peek(OperationContext* txn, BSONObj* op);
     void consume(OperationContext* txn);
     void clearSyncTarget();
-    void waitForMore(OperationContext* txn);
+    void waitForMore();
 
     // For monitoring
     BSONObj getCounters();
@@ -149,18 +145,15 @@ private:
     void _signalNoNewDataForApplier(OperationContext* txn);
 
     /**
-     * Record metrics.
-     */
-    void _recordStats(const OplogFetcher::DocumentsInfo& info, Milliseconds getMoreElapsedTime);
-
-    /**
      * Checks current background sync state before pushing operations into blocking queue and
      * updating metrics. If the queue is full, might block.
+     *
+     * requiredRBID is reset to empty after the first call.
      */
-    void _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                           Fetcher::Documents::const_iterator end,
-                           const OplogFetcher::DocumentsInfo& info,
-                           Milliseconds elapsed);
+    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
+                             Fetcher::Documents::const_iterator end,
+                             const OplogFetcher::DocumentsInfo& info,
+                             boost::optional<int>* requiredRBID);
 
     /**
      * Executes a rollback.
@@ -168,6 +161,7 @@ private:
      */
     void _rollback(OperationContext* txn,
                    const HostAndPort& source,
+                   boost::optional<int> requiredRBID,
                    stdx::function<DBClientBase*()> getConnection);
 
     // restart syncing
@@ -183,10 +177,6 @@ private:
 
     // A pointer to the replication coordinator external state.
     ReplicationCoordinatorExternalState* _replicationCoordinatorExternalState;
-
-    // Used to determine sync source.
-    // TODO(dannenberg) move into DataReplicator.
-    SyncSourceResolver _syncSourceResolver;
 
     // _mutex protects all of the class variables declared below.
     mutable stdx::mutex _mutex;
@@ -208,8 +198,12 @@ private:
 
     HostAndPort _syncSourceHost;
 
+    // Current sync source resolver validating sync source candidates.
+    // Pointer may be read on any thread that locks _mutex or unlocked on the BGSync thread. It can
+    // only be written to by the BGSync thread while holding _mutex.
+    std::unique_ptr<SyncSourceResolver> _syncSourceResolver;
+
     // Current oplog fetcher tailing the oplog on the sync source.
-    // Owned by us.
     std::unique_ptr<OplogFetcher> _oplogFetcher;
 };
 

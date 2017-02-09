@@ -59,6 +59,8 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -68,7 +70,6 @@ namespace repl {
 
 using std::string;
 using std::stringstream;
-
 
 class ReplExecutorSSM : public ServerStatusMetric {
 public:
@@ -86,7 +87,7 @@ public:
         help << "Just for tests.\n";
     }
     // No auth needed because it only works when enabled via command line.
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return Status::OK();
@@ -200,7 +201,18 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        status = getGlobalReplicationCoordinator()->processReplSetGetStatus(&result);
+        bool includeInitialSync = false;
+        Status initialSyncStatus =
+            bsonExtractBooleanFieldWithDefault(cmdObj, "initialSync", false, &includeInitialSync);
+        if (!initialSyncStatus.isOK()) {
+            return appendCommandStatus(result, initialSyncStatus);
+        }
+
+        auto responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kBasic;
+        if (includeInitialSync) {
+            responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kInitialSync;
+        }
+        status = getGlobalReplicationCoordinator()->processReplSetGetStatus(&result, responseStyle);
         return appendCommandStatus(result, status);
     }
 
@@ -573,7 +585,8 @@ class CmdReplSetSyncFrom : public ReplSetCommand {
 public:
     virtual void help(stringstream& help) const {
         help << "{ replSetSyncFrom : \"host:port\" }\n";
-        help << "Change who this member is syncing from.";
+        help << "Change who this member is syncing from. Note: This will interrupt and restart an "
+                "in-progress initial sync.";
     }
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
     virtual bool run(OperationContext* txn,
@@ -591,9 +604,9 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        return appendCommandStatus(
-            result,
-            getGlobalReplicationCoordinator()->processReplSetSyncFrom(targetHostAndPort, &result));
+        return appendCommandStatus(result,
+                                   getGlobalReplicationCoordinator()->processReplSetSyncFrom(
+                                       txn, targetHostAndPort, &result));
     }
 
 private:
@@ -627,7 +640,7 @@ public:
             // New style update position command has metadata, which may inform the
             // upstream of a higher term.
             auto metadata = metadataResult.getValue();
-            replCoord->processReplSetMetadata(metadata);
+            replCoord->processReplSetMetadata(metadata, false /*don't advance the commit point*/);
         }
 
         // In the case of an update from a member with an invalid replica set config,
@@ -726,17 +739,17 @@ public:
 
         /* we want to keep heartbeat connections open when relinquishing primary.
            tag them here. */
-        AbstractMessagingPort* mp = txn->getClient()->port();
-        unsigned originalTag = 0;
-        if (mp) {
-            originalTag = mp->getTag();
-            mp->setTag(originalTag | executor::NetworkInterface::kMessagingPortKeepOpen);
+        transport::Session::TagMask originalTag = 0;
+        auto session = txn->getClient()->session();
+        if (session) {
+            originalTag = session->getTags();
+            session->replaceTags(originalTag | transport::Session::kKeepOpen);
         }
 
         // Unset the tag on block exit
-        ON_BLOCK_EXIT([mp, originalTag]() {
-            if (mp) {
-                mp->setTag(originalTag);
+        ON_BLOCK_EXIT([session, originalTag]() {
+            if (session) {
+                session->replaceTags(originalTag);
             }
         });
 
@@ -859,7 +872,13 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
+        log() << "Received replSetStepUp request";
+
         status = getGlobalReplicationCoordinator()->stepUpIfEligible();
+
+        if (!status.isOK()) {
+            log() << "replSetStepUp request failed " << causedBy(status);
+        }
 
         return appendCommandStatus(result, status);
     }

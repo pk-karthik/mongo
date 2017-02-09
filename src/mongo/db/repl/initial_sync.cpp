@@ -71,10 +71,13 @@ void InitialSync::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTim
         OpQueue ops;
 
         auto replCoord = repl::ReplicationCoordinator::get(txn);
-        while (!tryPopAndWaitForMore(txn, &ops)) {
-            if (inShutdown()) {
+        while (!tryPopAndWaitForMore(txn, &ops, BatchLimits{})) {
+            if (globalInShutdownDeprecated()) {
                 return;
             }
+
+            // This code is only prepared for this to happen after inShutdown() becomes true.
+            invariant(!ops.mustShutdown());
 
             // nothing came back last time, so go again
             if (ops.empty())
@@ -93,17 +96,11 @@ void InitialSync::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTim
                          << " without seeing it. Rollback?";
                 fassertFailedNoTrace(18693);
             }
-
-            // apply replication batch limits
-            if (ops.getBytes() > replBatchLimitBytes)
-                break;
-            if (ops.getCount() > replBatchLimitOperations)
-                break;
         };
 
         if (ops.empty()) {
-            severe() << "got no ops for batch...";
-            fassertFailedNoTrace(18692);
+            // nothing came back last time, so go again
+            continue;
         }
 
         const BSONObj lastOp = ops.back().raw.getOwned();
@@ -114,9 +111,9 @@ void InitialSync::_applyOplogUntil(OperationContext* txn, const OpTime& endOpTim
         const OpTime lastOpTime = multiApply(txn, ops.releaseBatch());
 
         replCoord->setMyLastAppliedOpTime(lastOpTime);
-        setNewTimestamp(lastOpTime.getTimestamp());
+        setNewTimestamp(txn->getServiceContext(), lastOpTime.getTimestamp());
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             return;
         }
 

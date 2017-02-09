@@ -35,25 +35,23 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer/balancer.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
 using std::shared_ptr;
-using std::unique_ptr;
 using std::string;
 
 namespace {
@@ -82,7 +80,7 @@ public:
              << " , to : 'shard001' }\n";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -108,41 +106,28 @@ public:
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        std::shared_ptr<DBConfig> config;
+        auto scopedCM = uassertStatusOK(ScopedChunkManager::refreshAndGet(txn, nss));
 
-        {
-            auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status.getStatus());
-            }
-
-            config = status.getValue();
-        }
-
-        if (!config->isSharded(nss.ns())) {
-            config->reload(txn);
-
-            if (!config->isSharded(nss.ns())) {
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::NamespaceNotSharded,
-                                                  "ns [" + nss.ns() + " is not sharded."));
-            }
-        }
-
-        const string toString = cmdObj["to"].valuestrsafe();
+        const auto toElt = cmdObj["to"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'to' must be of type String",
+                toElt.type() == BSONType::String);
+        const std::string toString = toElt.str();
         if (!toString.size()) {
             errmsg = "you have to specify where you want to move the chunk";
             return false;
         }
 
-        const auto to = grid.shardRegistry()->getShard(txn, toString);
-        if (!to) {
+        const auto toStatus = Grid::get(txn)->shardRegistry()->getShard(txn, toString);
+        if (!toStatus.isOK()) {
             string msg(str::stream() << "Could not move chunk in '" << nss.ns() << "' to shard '"
                                      << toString
                                      << "' because that shard does not exist");
             log() << msg;
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
+
+        const auto to = toStatus.getValue();
 
         // so far, chunk size serves test purposes; it may or may not become a supported parameter
         long long maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
@@ -159,41 +144,35 @@ public:
             return false;
         }
 
-        // This refreshes the chunk metadata if stale.
-        shared_ptr<ChunkManager> info = config->getChunkManager(txn, nss.ns(), true);
+        auto const cm = scopedCM.cm();
+
         shared_ptr<Chunk> chunk;
 
         if (!find.isEmpty()) {
-            StatusWith<BSONObj> status =
-                info->getShardKeyPattern().extractShardKeyFromQuery(txn, find);
-
-            // Bad query
-            if (!status.isOK())
-                return appendCommandStatus(result, status.getStatus());
-
-            BSONObj shardKey = status.getValue();
-
+            // find
+            BSONObj shardKey =
+                uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(txn, find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
             }
 
-            chunk = info->findIntersectingChunk(txn, shardKey);
+            chunk = cm->findIntersectingChunkWithSimpleCollation(txn, shardKey);
         } else {
-            // Bounds
-            if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
-                !info->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
+            // bounds
+            if (!cm->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
+                !cm->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
                 errmsg = str::stream() << "shard key bounds "
                                        << "[" << bounds[0].Obj() << "," << bounds[1].Obj() << ")"
                                        << " are not valid for shard key pattern "
-                                       << info->getShardKeyPattern().toBSON();
+                                       << cm->getShardKeyPattern().toBSON();
                 return false;
             }
 
-            BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
-            BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
+            BSONObj minKey = cm->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
+            BSONObj maxKey = cm->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = info->findIntersectingChunk(txn, minKey);
+            chunk = cm->findIntersectingChunkWithSimpleCollation(txn, minKey);
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
@@ -202,26 +181,26 @@ public:
             }
         }
 
-        const auto from = grid.shardRegistry()->getShard(txn, chunk->getShardId());
-        if (from->getId() != to->getId()) {
-            const auto secondaryThrottle =
-                uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
+        const auto secondaryThrottle =
+            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
 
-            ChunkType chunkType;
-            chunkType.setNS(nss.ns());
-            chunkType.setMin(chunk->getMin());
-            chunkType.setMax(chunk->getMax());
-            chunkType.setShard(chunk->getShardId());
-            chunkType.setVersion(info->getVersion());
+        ChunkType chunkType;
+        chunkType.setNS(nss.ns());
+        chunkType.setMin(chunk->getMin());
+        chunkType.setMax(chunk->getMax());
+        chunkType.setShard(chunk->getShardId());
+        chunkType.setVersion(cm->getVersion());
 
-            uassertStatusOK(
-                Balancer::get(txn)->moveSingleChunk(txn,
+        uassertStatusOK(configsvr_client::moveChunk(txn,
                                                     chunkType,
                                                     to->getId(),
                                                     maxChunkSizeBytes,
                                                     secondaryThrottle,
                                                     cmdObj["_waitForDelete"].trueValue()));
-        }
+
+        // Proactively refresh the chunk manager. Not strictly necessary, but this way it's
+        // immediately up-to-date the next time it's used.
+        scopedCM.db()->getChunkManagerIfExists(txn, nss.ns(), true);
 
         result.append("millis", t.millis());
         return true;

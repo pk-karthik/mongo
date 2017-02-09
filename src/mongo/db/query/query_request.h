@@ -77,6 +77,12 @@ public:
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
 
     /**
+     * Converts this QR into an aggregation using $match. If this QR has options that cannot be
+     * satisfied by aggregation, a non-OK status is returned and 'cmdBuilder' is not modified.
+     */
+    StatusWith<BSONObj> asAggregationCommand() const;
+
+    /**
      * Parses maxTimeMS from the BSONElement containing its value.
      */
     static StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt);
@@ -386,6 +392,16 @@ public:
      * represents it or an error.
      */
     static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQueryMessage(const QueryMessage& qm);
+
+    /**
+     * Parse the provided legacy query object and parameters to construct a QueryRequest.
+     */
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQueryForTest(NamespaceString nss,
+                                                                            const BSONObj& queryObj,
+                                                                            const BSONObj& proj,
+                                                                            int ntoskip,
+                                                                            int ntoreturn,
+                                                                            int queryOptions);
 
 private:
     Status init(int ntoskip,

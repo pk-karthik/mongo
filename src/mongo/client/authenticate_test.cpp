@@ -87,12 +87,12 @@ public:
         ASSERT(!_requests.empty());
         RemoteCommandRequest expected = _requests.front();
         ASSERT(expected.dbname == request.dbname);
-        ASSERT_EQ(expected.cmdObj, request.cmdObj);
+        ASSERT_BSONOBJ_EQ(expected.cmdObj, request.cmdObj);
         _requests.pop();
 
         // Then pop a response and call the handler
         ASSERT(!_responses.empty());
-        handler(StatusWith<RemoteCommandResponse>(_responses.front()));
+        handler(_responses.front());
         _responses.pop();
     }
 
@@ -107,7 +107,7 @@ public:
     }
 
     void pushRequest(StringData dbname, const BSONObj& cmd) {
-        _requests.emplace(_mockHost, dbname.toString(), cmd);
+        _requests.emplace(_mockHost, dbname.toString(), cmd, nullptr);
     }
 
     BSONObj loadMongoCRConversation() {
@@ -179,29 +179,31 @@ public:
 
 TEST_F(AuthClientTest, MongoCR) {
     auto params = loadMongoCRConversation();
-    auth::authenticateClient(std::move(params), "", "", _runCommandCallback);
+    auth::authenticateClient(std::move(params), HostAndPort(), "", _runCommandCallback);
 }
 
 TEST_F(AuthClientTest, asyncMongoCR) {
     auto params = loadMongoCRConversation();
-    auth::authenticateClient(
-        std::move(params), "", "", _runCommandCallback, [this](auth::AuthResponse response) {
-            ASSERT(response.isOK());
-        });
+    auth::authenticateClient(std::move(params),
+                             HostAndPort(),
+                             "",
+                             _runCommandCallback,
+                             [this](auth::AuthResponse response) { ASSERT(response.isOK()); });
 }
 
 #ifdef MONGO_CONFIG_SSL
 TEST_F(AuthClientTest, X509) {
     auto params = loadX509Conversation();
-    auth::authenticateClient(std::move(params), "", _username, _runCommandCallback);
+    auth::authenticateClient(std::move(params), HostAndPort(), _username, _runCommandCallback);
 }
 
 TEST_F(AuthClientTest, asyncX509) {
     auto params = loadX509Conversation();
-    auth::authenticateClient(
-        std::move(params), "", _username, _runCommandCallback, [this](auth::AuthResponse response) {
-            ASSERT(response.isOK());
-        });
+    auth::authenticateClient(std::move(params),
+                             HostAndPort(),
+                             _username,
+                             _runCommandCallback,
+                             [this](auth::AuthResponse response) { ASSERT(response.isOK()); });
 }
 #endif
 

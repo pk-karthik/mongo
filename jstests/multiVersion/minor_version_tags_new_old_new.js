@@ -2,24 +2,33 @@
 (function() {
     'use strict';
 
-    // 3.2.1 is the final version to use the old style replSetUpdatePosition command.
-    var oldVersion = "3.2.1";
+    load("jstests/replsets/rslib.js");
+
+    var oldVersion = "last-stable";
     var newVersion = "latest";
-    var nodes = {
-        n1: {binVersion: newVersion},
-        n2: {binVersion: oldVersion},
-        n3: {binVersion: newVersion},
-        n4: {binVersion: oldVersion},
-        n5: {binVersion: newVersion}
-    };
+    let nodes = [
+        {binVersion: newVersion},
+        {binVersion: oldVersion},
+        {binVersion: newVersion},
+        {binVersion: oldVersion},
+        {binVersion: newVersion}
+    ];
     var host = getHostName();
     var name = 'tags';
 
-    var replTest = new ReplSetTest({name: name, nodes: nodes, useBridge: true});
-    var nodes = replTest.nodeList();
-    var conns = replTest.startSet();
+    var replTest = new ReplSetTest({name: name, nodes: {n0: nodes[0]}, useBridge: true});
+    replTest.startSet();
+    replTest.initiate();
+
+    for (let i = 1; i < nodes.length; ++i) {
+        replTest.add(nodes[i]);
+    }
+
+    const conns = replTest.nodes;
+    nodes = replTest.nodeList();
     var port = replTest.ports;
-    replTest.initiate({
+    var nextVersion = replTest.getReplSetConfigFromNode().version + 1;
+    const replSetConfig = {
         _id: name,
         members: [
             {
@@ -96,7 +105,10 @@
                 },
             },
         },
-    });
+        version: nextVersion,
+    };
+
+    reconfig(replTest, replSetConfig);
 
     replTest.waitForState(replTest.nodes[2], ReplSetTest.State.PRIMARY, 60 * 1000);
     replTest.awaitReplication();

@@ -32,6 +32,7 @@
 
 #include <utility>
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/fts/fts_index_format.h"
@@ -158,10 +159,8 @@ bool getS2GeoKeys(const BSONObj& document,
 /**
  * Fills 'out' with the keys that should be generated for an array value 'obj' in a 2dsphere index.
  * A key is generated for each element of the array value 'obj'.
- *
- * Returns true if 'obj' contains more than one element, and returns false otherwise.
  */
-bool getS2LiteralKeysArray(const BSONObj& obj, const CollatorInterface* collator, BSONObjSet* out) {
+void getS2LiteralKeysArray(const BSONObj& obj, const CollatorInterface* collator, BSONObjSet* out) {
     BSONObjIterator objIt(obj);
     if (!objIt.more()) {
         // Empty arrays are indexed as undefined.
@@ -170,33 +169,26 @@ bool getS2LiteralKeysArray(const BSONObj& obj, const CollatorInterface* collator
         out->insert(b.obj());
     } else {
         // Non-empty arrays are exploded.
-        size_t nArrElems = 0;
         while (objIt.more()) {
             BSONObjBuilder b;
             CollationIndexKey::collationAwareIndexKeyAppend(objIt.next(), collator, &b);
             out->insert(b.obj());
-            ++nArrElems;
-        }
-
-        if (nArrElems > 1) {
-            return true;
         }
     }
-    return false;
 }
 
 /**
  * Fills 'out' with the keys that should be generated for a value 'elt' in a 2dsphere index. If
  * 'elt' is an array value, then a key is generated for each element of the array value 'obj'.
  *
- * Returns true if 'elt' is an array value that contains more than one element, and returns false
- * otherwise.
+ * Returns true if 'elt' is an array value and returns false otherwise.
  */
 bool getS2OneLiteralKey(const BSONElement& elt,
                         const CollatorInterface* collator,
                         BSONObjSet* out) {
     if (Array == elt.type()) {
-        return getS2LiteralKeysArray(elt.Obj(), collator, out);
+        getS2LiteralKeysArray(elt.Obj(), collator, out);
+        return true;
     } else {
         // One thing, not an array, index as-is.
         BSONObjBuilder b;
@@ -211,13 +203,12 @@ bool getS2OneLiteralKey(const BSONElement& elt,
  * any element in 'elements' is an array value, then a key is generated for each element of that
  * array value.
  *
- * Returns true if any element of 'elements' is an array value that contains more than one element,
- * and returns false otherwise.
+ * Returns true if any element of 'elements' is an array value and returns false otherwise.
  */
 bool getS2LiteralKeys(const BSONElementSet& elements,
                       const CollatorInterface* collator,
                       BSONObjSet* out) {
-    bool indexedArrayValueWithMultipleElements = false;
+    bool foundIndexedArrayValue = false;
     if (0 == elements.size()) {
         // Missing fields are indexed as null.
         BSONObjBuilder b;
@@ -225,12 +216,11 @@ bool getS2LiteralKeys(const BSONElementSet& elements,
         out->insert(b.obj());
     } else {
         for (BSONElementSet::iterator i = elements.begin(); i != elements.end(); ++i) {
-            const bool thisElemIsArrayWithMultipleElements = getS2OneLiteralKey(*i, collator, out);
-            indexedArrayValueWithMultipleElements =
-                indexedArrayValueWithMultipleElements || thisElemIsArrayWithMultipleElements;
+            const bool thisElemIsArray = getS2OneLiteralKey(*i, collator, out);
+            foundIndexedArrayValue = foundIndexedArrayValue || thisElemIsArray;
         }
     }
-    return indexedArrayValueWithMultipleElements;
+    return foundIndexedArrayValue;
 }
 
 }  // namespace
@@ -460,7 +450,7 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
                                       const S2IndexingParams& params,
                                       BSONObjSet* keys,
                                       MultikeyPaths* multikeyPaths) {
-    BSONObjSet keysToAdd;
+    BSONObjSet keysToAdd = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
 
     // Does one of our documents have a geo field?
     bool haveGeoField = false;
@@ -485,12 +475,12 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
         // Trailing array values aren't being expanded, so we still need to determine whether the
         // last component of the indexed path 'keyElem.fieldName()' causes the index to be multikey.
         // We say that it does if
-        //   (a) the last component of the indexed path ever refers to an array value containing
-        //       multiple elements, or if
+        //   (a) the last component of the indexed path ever refers to an array value (regardless of
+        //       the number of array elements)
         //   (b) the last component of the indexed path ever refers to GeoJSON data that requires
         //       multiple cells for its covering.
         bool lastPathComponentCausesIndexToBeMultikey;
-        BSONObjSet keysForThisField;
+        BSONObjSet keysForThisField = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
         if (IndexNames::GEO_2DSPHERE == keyElem.valuestr()) {
             if (params.indexVersion >= S2_INDEX_VERSION_2) {
                 // For >= V2,
@@ -546,7 +536,7 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
             continue;
         }
 
-        BSONObjSet updatedKeysToAdd;
+        BSONObjSet updatedKeysToAdd = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
         for (BSONObjSet::const_iterator it = keysToAdd.begin(); it != keysToAdd.end(); ++it) {
             for (BSONObjSet::const_iterator newIt = keysForThisField.begin();
                  newIt != keysForThisField.end();
@@ -570,7 +560,7 @@ void ExpressionKeysPrivate::getS2Keys(const BSONObj& obj,
 
     if (keysToAdd.size() > params.maxKeysPerInsert) {
         warning() << "Insert of geo object generated a high number of keys."
-                  << " num keys: " << keysToAdd.size() << " obj inserted: " << obj;
+                  << " num keys: " << keysToAdd.size() << " obj inserted: " << redact(obj);
     }
 
     *keys = keysToAdd;

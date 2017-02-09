@@ -47,7 +47,7 @@ __metadata_init(WT_SESSION_IMPL *session)
 	 * We're single-threaded, but acquire the schema lock regardless: the
 	 * lower level code checks that it is appropriately synchronized.
 	 */
-	WT_WITH_SCHEMA_LOCK(session, ret,
+	WT_WITH_SCHEMA_LOCK(session,
 	    ret = __wt_schema_create(session, WT_METAFILE_URI, NULL));
 
 	return (ret);
@@ -158,7 +158,7 @@ __wt_turtle_init(WT_SESSION_IMPL *session)
 	 * Discard any turtle setup file left-over from previous runs.  This
 	 * doesn't matter for correctness, it's just cleaning up random files.
 	 */
-	WT_RET(__wt_remove_if_exists(session, WT_METADATA_TURTLE_SET));
+	WT_RET(__wt_remove_if_exists(session, WT_METADATA_TURTLE_SET, false));
 
 	/*
 	 * We could die after creating the turtle file and before creating the
@@ -197,9 +197,10 @@ __wt_turtle_init(WT_SESSION_IMPL *session)
 			    "Both %s and %s exist; recreating metadata from "
 			    "backup",
 			    WT_METADATA_TURTLE, WT_METADATA_BACKUP));
-			WT_RET(__wt_remove_if_exists(session, WT_METAFILE));
+			WT_RET(
+			    __wt_remove_if_exists(session, WT_METAFILE, false));
 			WT_RET(__wt_remove_if_exists(
-			    session, WT_METADATA_TURTLE));
+			    session, WT_METADATA_TURTLE, false));
 			load = true;
 		}
 	} else
@@ -219,9 +220,8 @@ __wt_turtle_init(WT_SESSION_IMPL *session)
 
 		/* Create the turtle file. */
 		WT_RET(__metadata_config(session, &metaconf));
-		WT_WITH_TURTLE_LOCK(session, ret,
-		    ret = __wt_turtle_update(
-		    session, WT_METAFILE_URI, metaconf));
+		WT_WITH_TURTLE_LOCK(session, ret =
+		    __wt_turtle_update(session, WT_METAFILE_URI, metaconf));
 		WT_ERR(ret);
 	}
 
@@ -305,7 +305,7 @@ __wt_turtle_update(WT_SESSION_IMPL *session, const char *key, const char *value)
 	 * every time.
 	 */
 	WT_RET(__wt_fopen(session, WT_METADATA_TURTLE_SET,
-	    WT_OPEN_CREATE | WT_OPEN_EXCLUSIVE, WT_STREAM_WRITE, &fs));
+	    WT_FS_OPEN_CREATE | WT_FS_OPEN_EXCLUSIVE, WT_STREAM_WRITE, &fs));
 
 	version = wiredtiger_version(&vmajor, &vminor, &vpatch);
 	WT_ERR(__wt_fprintf(session, fs,
@@ -320,7 +320,7 @@ __wt_turtle_update(WT_SESSION_IMPL *session, const char *key, const char *value)
 
 	/* Close any file handle left open, remove any temporary file. */
 err:	WT_TRET(__wt_fclose(session, &fs));
-	WT_TRET(__wt_remove_if_exists(session, WT_METADATA_TURTLE_SET));
+	WT_TRET(__wt_remove_if_exists(session, WT_METADATA_TURTLE_SET, false));
 
 	return (ret);
 }

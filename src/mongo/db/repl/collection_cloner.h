@@ -34,19 +34,28 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/fetcher.h"
+#include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/base_cloner.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/callback_completion_guard.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/task_runner.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/progress_meter.h"
 
 namespace mongo {
+
+class OldThreadPool;
+
 namespace repl {
 
 class StorageInterface;
@@ -55,25 +64,34 @@ class CollectionCloner : public BaseCloner {
     MONGO_DISALLOW_COPYING(CollectionCloner);
 
 public:
+    /**
+     * Callback completion guard for CollectionCloner.
+     */
+    using OnCompletionGuard = CallbackCompletionGuard<Status>;
+
     struct Stats {
+        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
+        static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
+
+        std::string ns;
         Date_t start;
         Date_t end;
-        size_t documents{0};
+        size_t documentToCopy{0};
+        size_t documentsCopied{0};
         size_t indexes{0};
         size_t fetchBatches{0};
 
         std::string toString() const;
         BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
     };
     /**
-     * Type of function to schedule database work with the executor.
-     *
-     * Must be consistent with ReplicationExecutor::scheduleWorkWithGlobalExclusiveLock().
+     * Type of function to schedule storage interface tasks with the executor.
      *
      * Used for testing only.
      */
-    using ScheduleDbWorkFn = stdx::function<StatusWith<ReplicationExecutor::CallbackHandle>(
-        const ReplicationExecutor::CallbackFn&)>;
+    using ScheduleDbWorkFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+        const executor::TaskExecutor::CallbackFn&)>;
 
     /**
      * Creates CollectionCloner task in inactive state. Use start() to activate cloner.
@@ -84,7 +102,8 @@ public:
      *
      * Takes ownership of the passed StorageInterface object.
      */
-    CollectionCloner(ReplicationExecutor* executor,
+    CollectionCloner(executor::TaskExecutor* executor,
+                     OldThreadPool* dbWorkThreadPool,
                      const HostAndPort& source,
                      const NamespaceString& sourceNss,
                      const CollectionOptions& options,
@@ -99,11 +118,11 @@ public:
 
     bool isActive() const override;
 
-    Status start() override;
+    Status startup() noexcept override;
 
-    void cancel() override;
+    void shutdown() override;
 
-    void wait() override;
+    void join() override;
 
     CollectionCloner::Stats getStats() const;
 
@@ -124,9 +143,27 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn(const ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn);
 
 private:
+    bool _isActive_inlock() const;
+
+    /**
+     * Returns whether the CollectionCloner is in shutdown.
+     */
+    bool _isShuttingDown() const;
+
+    /**
+     * Cancels all outstanding work.
+     * Used by shutdown() and CompletionGuard::setResultAndCancelRemainingWork().
+     */
+    void _cancelRemainingWork_inlock();
+
+    /**
+     * Read number of documents in collection from count result.
+     */
+    void _countCallback(const executor::TaskExecutor::RemoteCommandCallbackArgs& args);
+
     /**
      * Read index specs from listIndexes result.
      */
@@ -139,7 +176,8 @@ private:
      */
     void _findCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
                        Fetcher::NextAction* nextAction,
-                       BSONObjBuilder* getMoreBob);
+                       BSONObjBuilder* getMoreBob,
+                       std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Request storage interface to create collection.
@@ -150,7 +188,7 @@ private:
      * 'nextAction' is an in/out arg indicating the next action planned and to be taken
      *  by the fetcher.
      */
-    void _beginCollectionCallback(const ReplicationExecutor::CallbackArgs& callbackData);
+    void _beginCollectionCallback(const executor::TaskExecutor::CallbackArgs& callbackData);
 
     /**
      * Called multiple times if there are more than one batch of documents from the fetcher.
@@ -159,8 +197,9 @@ private:
      * Each document returned will be inserted via the storage interfaceRequest storage
      * interface.
      */
-    void _insertDocumentsCallback(const ReplicationExecutor::CallbackArgs& callbackData,
-                                  bool lastBatch);
+    void _insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& callbackData,
+                                  bool lastBatch,
+                                  std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
     /**
      * Reports completion status.
@@ -180,25 +219,34 @@ private:
     //
     mutable stdx::mutex _mutex;
     mutable stdx::condition_variable _condition;        // (M)
-    ReplicationExecutor* _executor;                     // (R) Not owned by us.
+    executor::TaskExecutor* _executor;                  // (R) Not owned by us.
+    OldThreadPool* _dbWorkThreadPool;                   // (R) Not owned by us.
     HostAndPort _source;                                // (R)
     NamespaceString _sourceNss;                         // (R)
     NamespaceString _destNss;                           // (R)
     CollectionOptions _options;                         // (R)
     std::unique_ptr<CollectionBulkLoader> _collLoader;  // (M)
-    CallbackFn _onCompletion;             // (R) Invoked once when cloning completes or fails.
+    CallbackFn _onCompletion;             // (M) Invoked once when cloning completes or fails.
     StorageInterface* _storageInterface;  // (R) Not owned by us.
-    bool _active;                         // (M) true when Collection Cloner is started.
-    Fetcher _listIndexesFetcher;          // (S)
-    Fetcher _findFetcher;                 // (S)
-    std::vector<BSONObj> _indexSpecs;     // (M)
-    BSONObj _idIndexSpec;                 // (M)
-    std::vector<BSONObj> _documents;      // (M) Documents read from fetcher to insert.
-    ReplicationExecutor::CallbackHandle
-        _dbWorkCallbackHandle;  // (M) Callback handle for database worker.
+    RemoteCommandRetryScheduler _countScheduler;  // (S)
+    Fetcher _listIndexesFetcher;                  // (S)
+    std::unique_ptr<Fetcher> _findFetcher;        // (M)
+    std::vector<BSONObj> _indexSpecs;             // (M)
+    BSONObj _idIndexSpec;                         // (M)
+    std::vector<BSONObj> _documents;              // (M) Documents read from fetcher to insert.
+    TaskRunner _dbWorkTaskRunner;                 // (R)
     ScheduleDbWorkFn
-        _scheduleDbWorkFn;  // (RT) Function for scheduling database work using the executor.
-    Stats _stats;           // (M) stats for this instance.
+        _scheduleDbWorkFn;         // (RT) Function for scheduling database work using the executor.
+    Stats _stats;                  // (M) stats for this instance.
+    ProgressMeter _progressMeter;  // (M) progress meter for this instance.
+
+    // State transitions:
+    // PreStart --> Running --> ShuttingDown --> Complete
+    // It is possible to skip intermediate states. For example,
+    // Calling shutdown() when the cloner has not started will transition from PreStart directly
+    // to Complete.
+    enum class State { kPreStart, kRunning, kShuttingDown, kComplete };
+    State _state = State::kPreStart;  // (M)
 };
 
 }  // namespace repl

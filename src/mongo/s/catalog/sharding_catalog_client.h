@@ -62,6 +62,7 @@ class Status;
 template <typename T>
 class StatusWith;
 class TagsType;
+class VersionType;
 
 namespace executor {
 struct ConnectionPoolStats;
@@ -92,6 +93,7 @@ class ShardingCatalogClient {
     MONGO_DISALLOW_COPYING(ShardingCatalogClient);
 
 public:
+    // Constant to use for configuration data majority writes
     static const WriteConcernOptions kMajorityWriteConcern;
 
     virtual ~ShardingCatalogClient() = default;
@@ -125,6 +127,10 @@ public:
      *
      * @param ns: namespace of collection to shard
      * @param fieldsAndOrder: shardKey pattern
+     * @param defaultCollation: the default collation for the collection, to be written to
+     *     config.collections. If empty, the collection default collation is simple binary
+     *     comparison. Note the the shard key collation will always be simple binary comparison,
+     *     even if the collection default collation is non-simple.
      * @param unique: if true, ensure underlying index enforces a unique constraint.
      * @param initPoints: create chunks based on a set of specified split points.
      * @param initShardIds: If non-empty, specifies the set of shards to assign chunks between.
@@ -138,6 +144,7 @@ public:
     virtual Status shardCollection(OperationContext* txn,
                                    const std::string& ns,
                                    const ShardKeyPattern& fieldsAndOrder,
+                                   const BSONObj& defaultCollation,
                                    bool unique,
                                    const std::vector<BSONObj>& initPoints,
                                    const std::set<ShardId>& initShardIds) = 0;
@@ -238,6 +245,7 @@ public:
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that chunks can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
+     * @param readConcern The readConcern to use while querying for chunks.
      *
      * Returns a !OK status if an error occurs.
      */
@@ -246,7 +254,8 @@ public:
                              const BSONObj& sort,
                              boost::optional<int> limit,
                              std::vector<ChunkType>* chunks,
-                             repl::OpTime* opTime) = 0;
+                             repl::OpTime* opTime,
+                             repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves all tags for the specified collection.
@@ -256,19 +265,11 @@ public:
                                         std::vector<TagsType>* tags) = 0;
 
     /**
-     * Retrieves the most appropriate tag, which overlaps with the specified chunk. If no tags
-     * overlap, returns an empty string.
-     */
-    virtual StatusWith<std::string> getTagForChunk(OperationContext* txn,
-                                                   const std::string& collectionNs,
-                                                   const ChunkType& chunk) = 0;
-
-    /**
      * Retrieves all shards in this sharded cluster.
      * Returns a !OK status if an error occurs.
      */
     virtual StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-        OperationContext* txn) = 0;
+        OperationContext* txn, repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Runs a user management command on the config servers, potentially synchronizing through
@@ -303,6 +304,8 @@ public:
      * @param nss: namespace string for the chunks collection.
      * @param lastChunkVersion: version of the last document being written to the chunks
      * collection.
+     * @param writeConcern: writeConcern to use for applying documents.
+     * @param readConcern: readConcern to use for verifying that documents have been applied.
      *
      * 'nss' and 'lastChunkVersion' uniquely identify the last document being written, which is
      * expected to appear in the chunks collection on success. This is important for the
@@ -314,7 +317,9 @@ public:
                                            const BSONArray& updateOps,
                                            const BSONArray& preCondition,
                                            const std::string& nss,
-                                           const ChunkVersion& lastChunkVersion) = 0;
+                                           const ChunkVersion& lastChunkVersion,
+                                           const WriteConcernOptions& writeConcern,
+                                           repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Writes a diagnostic event to the action log.
@@ -330,7 +335,8 @@ public:
     virtual Status logChange(OperationContext* txn,
                              const std::string& what,
                              const std::string& ns,
-                             const BSONObj& detail) = 0;
+                             const BSONObj& detail,
+                             const WriteConcernOptions& writeConcern) = 0;
 
     /**
      * Reads global sharding settings from the confing.settings collection. The key parameter is
@@ -343,6 +349,13 @@ public:
      * setting otherwise.
      */
     virtual StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) = 0;
+
+    /**
+     * Returns the contents of the config.version document - containing the current cluster schema
+     * version as well as the clusterID.
+     */
+    virtual StatusWith<VersionType> getConfigVersion(OperationContext* txn,
+                                                     repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Directly sends the specified command to the config server and returns the response.
@@ -376,7 +389,7 @@ public:
      * Directly inserts a document in the specified namespace on the config server. The document
      * must have an _id index. Must only be used for insertions in the 'config' database.
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status insertConfigDocument(OperationContext* txn,
                                         const std::string& ns,
@@ -395,7 +408,7 @@ public:
      * was upserted or it existed and any of the fields changed) and false otherwise (basically
      * returns whether the update command's response update.n value is > 0).
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual StatusWith<bool> updateConfigDocument(OperationContext* txn,
                                                   const std::string& ns,
@@ -408,7 +421,7 @@ public:
      * Removes documents matching a particular query predicate from the specified namespace on the
      * config server. Must only be used for deletions from the 'config' database.
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
+     * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status removeConfigDocuments(OperationContext* txn,
                                          const std::string& ns,
@@ -416,18 +429,13 @@ public:
                                          const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Appends the information about the config and admin databases in the config server
-     * with the format for listDatabase.
+     * Appends the information about the config and admin databases in the config server with the
+     * format for listDatabases, based on the listDatabases command parameters in
+     * 'listDatabasesCmd'.
      */
     virtual Status appendInfoForConfigServerDatabases(OperationContext* txn,
+                                                      const BSONObj& listDatabasesCmd,
                                                       BSONArrayBuilder* builder) = 0;
-
-
-    virtual StatusWith<DistLockManager::ScopedDistLock> distLock(
-        OperationContext* txn,
-        StringData name,
-        StringData whyMessage,
-        Milliseconds waitFor = DistLockManager::kSingleLockAttemptTimeout) = 0;
 
     /**
      * Obtains a reference to the distributed lock manager instance to use for synchronizing
@@ -437,7 +445,6 @@ public:
      * be cached.
      */
     virtual DistLockManager* getDistLockManager() = 0;
-
 
 protected:
     ShardingCatalogClient() = default;

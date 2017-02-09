@@ -87,7 +87,7 @@ void prefetchIndexPages(OperationContext* txn,
                 invariant(iam);
                 iam->touch(txn, obj);
             } catch (const DBException& e) {
-                LOG(2) << "ignoring exception in prefetchIndexPages(): " << e.what() << endl;
+                LOG(2) << "ignoring exception in prefetchIndexPages(): " << redact(e);
             }
             break;
         }
@@ -105,7 +105,7 @@ void prefetchIndexPages(OperationContext* txn,
                     verify(iam);
                     iam->touch(txn, obj);
                 } catch (const DBException& e) {
-                    LOG(2) << "ignoring exception in prefetchIndexPages(): " << e.what() << endl;
+                    LOG(2) << "ignoring exception in prefetchIndexPages(): " << redact(e);
                 }
             }
             break;
@@ -126,7 +126,8 @@ void prefetchRecordPages(OperationContext* txn, Database* db, const char* ns, co
         try {
             if (Helpers::findById(txn, db, ns, builder.done(), result)) {
                 // do we want to use Record::touch() here?  it's pretty similar.
-                volatile char _dummy_char = '\0';
+                // volatile - avoid compiler optimizations for touching a mmap page
+                volatile char _dummy_char = '\0';  // NOLINT
 
                 // Touch the first word on every page in order to fault it into memory
                 for (int i = 0; i < result.objsize(); i += g_minOSPageSizeBytes) {
@@ -136,7 +137,7 @@ void prefetchRecordPages(OperationContext* txn, Database* db, const char* ns, co
                 _dummy_char += *(result.objdata() + result.objsize() - 1);
             }
         } catch (const DBException& e) {
-            LOG(2) << "ignoring exception in prefetchRecordPages(): " << e.what() << endl;
+            LOG(2) << "ignoring exception in prefetchRecordPages(): " << redact(e);
         }
     }
 }
@@ -175,7 +176,7 @@ void prefetchPagesForReplicatedOp(OperationContext* txn, Database* db, const BSO
         return;
     }
 
-    LOG(4) << "index prefetch for op " << *opType << endl;
+    LOG(4) << "index prefetch for op " << *opType;
 
     // should we prefetch index pages on updates? if the update is in-place and doesn't change
     // indexed values, it is actually slower - a lot slower if there are a dozen indexes or
@@ -248,7 +249,7 @@ public:
     }
 
     virtual Status setFromString(const string& prefetch) {
-        log() << "changing replication index prefetch behavior to " << prefetch << endl;
+        log() << "changing replication index prefetch behavior to " << prefetch;
 
         ReplSettings::IndexPrefetchConfig prefetchConfig;
 

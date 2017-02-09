@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
@@ -107,6 +108,30 @@ bool scansAreEquivalent(const QuerySolutionNode* lhs, const QuerySolutionNode* r
     return *leftIxscan == *rightIxscan;
 }
 
+/**
+ * If all nodes can provide the requested sort, returns a vector expressing which nodes must have
+ * their index scans reversed to provide the sort. Otherwise, returns an empty vector.
+ * 'nodes' must not be empty.
+ */
+std::vector<bool> canProvideSortWithMergeSort(const std::vector<QuerySolutionNode*>& nodes,
+                                              const BSONObj& requestedSort) {
+    invariant(!nodes.empty());
+    std::vector<bool> shouldReverseScan;
+    const auto reverseSort = QueryPlannerCommon::reverseSortObj(requestedSort);
+    for (auto&& node : nodes) {
+        node->computeProperties();
+        auto sorts = node->getSort();
+        if (sorts.find(requestedSort) != sorts.end()) {
+            shouldReverseScan.push_back(false);
+        } else if (sorts.find(reverseSort) != sorts.end()) {
+            shouldReverseScan.push_back(true);
+        } else {
+            return {};
+        }
+    }
+    return shouldReverseScan;
+}
+
 }  // namespace
 
 namespace mongo {
@@ -174,8 +199,7 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
         bool indexIs2D = (String == elt.type() && "2d" == elt.String());
 
         if (indexIs2D) {
-            GeoNear2DNode* ret = new GeoNear2DNode();
-            ret->indexKeyPattern = index.keyPattern;
+            GeoNear2DNode* ret = new GeoNear2DNode(index);
             ret->nq = &nearExpr->getData();
             ret->baseBounds.fields.resize(index.keyPattern.nFields());
             if (NULL != query.getProj()) {
@@ -185,8 +209,7 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
 
             return ret;
         } else {
-            GeoNear2DSphereNode* ret = new GeoNear2DSphereNode();
-            ret->indexKeyPattern = index.keyPattern;
+            GeoNear2DSphereNode* ret = new GeoNear2DSphereNode(index);
             ret->nq = &nearExpr->getData();
             ret->baseBounds.fields.resize(index.keyPattern.nFields());
             if (NULL != query.getProj()) {
@@ -199,20 +222,16 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
         // We must not keep the expression node around.
         *tightnessOut = IndexBoundsBuilder::EXACT;
         TextMatchExpressionBase* textExpr = static_cast<TextMatchExpressionBase*>(expr);
-        TextNode* ret = new TextNode();
-        ret->indexKeyPattern = index.keyPattern;
+        TextNode* ret = new TextNode(index);
         ret->ftsQuery = textExpr->getFTSQuery().clone();
         return ret;
     } else {
         // Note that indexKeyPattern.firstElement().fieldName() may not equal expr->path()
         // because expr might be inside an array operator that provides a path prefix.
-        IndexScanNode* isn = new IndexScanNode();
-        isn->indexKeyPattern = index.keyPattern;
-        isn->indexIsMultiKey = index.multikey;
+        IndexScanNode* isn = new IndexScanNode(index);
         isn->bounds.fields.resize(index.keyPattern.nFields());
         isn->maxScan = query.getQueryRequest().getMaxScan();
         isn->addKeyMetadata = query.getQueryRequest().returnKey();
-        isn->indexCollator = index.collator;
         isn->queryCollator = query.getCollator();
 
         // Get the ixtag->pos-th element of the index key pattern.
@@ -402,7 +421,7 @@ void QueryPlannerAccess::finishTextNode(QuerySolutionNode* node, const IndexEntr
     // For example, say keyPattern = { a: 1, _fts: "text", _ftsx: 1, b: 1 }
     // prefixEnd should be 1.
     size_t prefixEnd = 0;
-    BSONObjIterator it(tn->indexKeyPattern);
+    BSONObjIterator it(tn->index.keyPattern);
     // Count how many prefix terms we have.
     while (it.more()) {
         // We know that the only key pattern with a type of String is the _fts field
@@ -977,7 +996,7 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedAnd(const CanonicalQuery& que
             AndSortedNode* asn = new AndSortedNode();
             asn->children.swap(ixscanNodes);
             andResult = asn;
-        } else if (internalQueryPlannerEnableHashIntersection) {
+        } else if (internalQueryPlannerEnableHashIntersection.load()) {
             AndHashNode* ahn = new AndHashNode();
             ahn->children.swap(ixscanNodes);
             andResult = ahn;
@@ -1086,39 +1105,25 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedOr(const CanonicalQuery& quer
     if (1 == ixscanNodes.size()) {
         orResult = ixscanNodes[0];
     } else {
-        bool shouldMergeSort = false;
+        std::vector<bool> shouldReverseScan;
 
         if (!query.getQueryRequest().getSort().isEmpty()) {
-            const BSONObj& desiredSort = query.getQueryRequest().getSort();
+            // If all ixscanNodes can provide the sort, shouldReverseScan is populated with which
+            // scans to reverse.
+            shouldReverseScan =
+                canProvideSortWithMergeSort(ixscanNodes, query.getQueryRequest().getSort());
+        }
 
-            // If there exists a sort order that is present in each child, we can merge them and
-            // maintain that sort order / those sort orders.
-            ixscanNodes[0]->computeProperties();
-            BSONObjSet sharedSortOrders = ixscanNodes[0]->getSort();
-
-            if (!sharedSortOrders.empty()) {
-                for (size_t i = 1; i < ixscanNodes.size(); ++i) {
-                    ixscanNodes[i]->computeProperties();
-                    BSONObjSet isect;
-                    set_intersection(sharedSortOrders.begin(),
-                                     sharedSortOrders.end(),
-                                     ixscanNodes[i]->getSort().begin(),
-                                     ixscanNodes[i]->getSort().end(),
-                                     std::inserter(isect, isect.end()),
-                                     BSONObjCmp());
-                    sharedSortOrders = isect;
-                    if (sharedSortOrders.empty()) {
-                        break;
-                    }
+        if (!shouldReverseScan.empty()) {
+            // Each node can provide either the requested sort, or the reverse of the requested
+            // sort.
+            invariant(ixscanNodes.size() == shouldReverseScan.size());
+            for (size_t i = 0; i < ixscanNodes.size(); ++i) {
+                if (shouldReverseScan[i]) {
+                    QueryPlannerCommon::reverseScans(ixscanNodes[i]);
                 }
             }
 
-            // TODO: If we're looking for the reverse of one of these sort orders we could
-            // possibly reverse the ixscan nodes.
-            shouldMergeSort = (sharedSortOrders.end() != sharedSortOrders.find(desiredSort));
-        }
-
-        if (shouldMergeSort) {
             MergeSortNode* msn = new MergeSortNode();
             msn->sort = query.getQueryRequest().getSort();
             msn->children.swap(ixscanNodes);
@@ -1246,12 +1251,9 @@ QuerySolutionNode* QueryPlannerAccess::scanWholeIndex(const IndexEntry& index,
     QuerySolutionNode* solnRoot = NULL;
 
     // Build an ixscan over the id index, use it, and return it.
-    unique_ptr<IndexScanNode> isn = make_unique<IndexScanNode>();
-    isn->indexKeyPattern = index.keyPattern;
-    isn->indexIsMultiKey = index.multikey;
+    unique_ptr<IndexScanNode> isn = make_unique<IndexScanNode>(index);
     isn->maxScan = query.getQueryRequest().getMaxScan();
     isn->addKeyMetadata = query.getQueryRequest().returnKey();
-    isn->indexCollator = index.collator;
     isn->queryCollator = query.getCollator();
 
     IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds);
@@ -1384,17 +1386,14 @@ QuerySolutionNode* QueryPlannerAccess::makeIndexScan(const IndexEntry& index,
     QuerySolutionNode* solnRoot = NULL;
 
     // Build an ixscan over the id index, use it, and return it.
-    IndexScanNode* isn = new IndexScanNode();
-    isn->indexKeyPattern = index.keyPattern;
-    isn->indexIsMultiKey = index.multikey;
+    IndexScanNode* isn = new IndexScanNode(index);
     isn->direction = 1;
     isn->maxScan = query.getQueryRequest().getMaxScan();
     isn->addKeyMetadata = query.getQueryRequest().returnKey();
     isn->bounds.isSimpleRange = true;
     isn->bounds.startKey = startKey;
     isn->bounds.endKey = endKey;
-    isn->bounds.endKeyInclusive = false;
-    isn->indexCollator = index.collator;
+    isn->bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
     isn->queryCollator = query.getCollator();
 
     unique_ptr<MatchExpression> filter = query.root()->shallowClone();

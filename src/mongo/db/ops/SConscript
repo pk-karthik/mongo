@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
     target='update_common',
     source=[
@@ -13,7 +15,6 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/util/foundation',
         '$BUILD_DIR/mongo/db/matcher/expressions',
     ],
 )
@@ -257,5 +258,37 @@ env.CppUnitTest(
     LIBDEPS=[
         'write_ops_parsers',
         '$BUILD_DIR/mongo/client/clientdriver',
+    ],
+)
+
+env.Library(
+    target="write_ops",
+    source=[
+        "delete.cpp",
+        "insert.cpp",
+        "parsed_delete.cpp",
+        "parsed_update.cpp",
+        "update.cpp",
+        "update_lifecycle_impl.cpp",
+        "update_result.cpp",
+        "write_ops_exec.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/catalog',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
+        '$BUILD_DIR/mongo/db/query/query',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',
+        '$BUILD_DIR/mongo/db/service_context',
+        'update_driver',
+        #'$BUILD_DIR/mongo/db/commands/dcommands', # CYCLE
+        '$BUILD_DIR/mongo/db/introspect',
+        '$BUILD_DIR/mongo/db/curop_metrics',
+    ],
+    LIBDEPS_TAGS=[
+        # TODO(ADAM, 2017-01-10): See `CYCLE` tags above.
+        # The only undefined symbol is `mongo::Command::run` from `dcommands`.
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )

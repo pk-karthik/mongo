@@ -375,7 +375,7 @@ inline Status validate(const BSONObj& original,
             }
 
             // If we have both (old and new), compare them. If we just have new we are good
-            if (oldElem.ok() && newElem.compareWithBSONElement(oldElem, false) != 0) {
+            if (oldElem.ok() && newElem.compareWithBSONElement(oldElem, nullptr, false) != 0) {
                 return Status(ErrorCodes::ImmutableField,
                               mongoutils::str::stream()
                                   << "After applying the update to the document {"
@@ -507,10 +507,6 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
         dassert(cq);
         verify(cq->root()->matchesBSON(oldObj.value(), &matchDetails));
-
-        // If we have matched more than one array position, we cannot perform a positional update
-        // operation.
-        uassert(34412, "ambiguous positional update operation", matchDetails.isValid());
 
         string matchedField;
         if (matchDetails.hasElemMatchKey())
@@ -1010,7 +1006,7 @@ Status UpdateStage::restoreUpdateState() {
         !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString);
 
     if (userInitiatedWritesAndNotPrimary) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::PrimarySteppedDown,
                       str::stream() << "Demoted from primary while performing update on "
                                     << nsString.ns());
     }

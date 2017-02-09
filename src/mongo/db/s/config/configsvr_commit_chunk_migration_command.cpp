@@ -26,9 +26,11 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -37,13 +39,16 @@
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/commit_chunk_migration_request_type.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
 
 /**
@@ -64,10 +69,11 @@ namespace {
  * Command Format:
  * {
  *   _configsvrCommitChunkMigration: <database>.<collection>,
- *   migratedChunk: {min: <min_value>, max: <max_value>},
- *   controlChunk: {min: <min_value>, max: <max_value>},  (optional)
  *   fromShard: "<from_shard_name>",
  *   toShard: "<to_shard_name>",
+ *   migratedChunk: {min: <min_value>, max: <max_value>, etc. },
+ *   controlChunk: {min: <min_value>, max: <max_value>, etc. },  (optional)
+ *   fromShardCollectionVersion: { shardVersionField: <version> }, (for backward compatibility only)
  * }
  *
  * Returns:
@@ -97,7 +103,7 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -111,246 +117,30 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    /**
-     * Returns a BSON subobject from "field" in "source".
-     */
-    StatusWith<BSONObj> getBSONField(const BSONObj& source, StringData field) {
-        BSONElement fieldElement;
-        Status status = bsonExtractTypedField(source, field, BSONType::Object, &fieldElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        return fieldElement.Obj().getOwned();
-    }
-
-    /**
-     * Parses a string value from "field" in "source" and returns it.
-     */
-    static std::string extractString(const BSONObj source, StringData field) {
-        std::string stringResult;
-        Status status = bsonExtractStringField(source, field, &stringResult);
-        uassert(status.code(),
-                str::stream() << "Failed to parse '" << field << "' field from BSON '"
-                              << source.jsonString()
-                              << "'"
-                              << causedBy(status),
-                status.isOK());
-        uassert(status.code(),
-                str::stream() << "'" << field << "' field in BSON '" << source.jsonString()
-                              << "' is empty",
-                stringResult.length() > 0);
-        return stringResult;
-    }
-
-    static void checkChunkIsOnShard(OperationContext* txn,
-                                    const NamespaceString& nss,
-                                    const BSONObj& min,
-                                    const BSONObj& max,
-                                    StringData shard) {
-        BSONObj chunkQuery =
-            BSON(ChunkType::ns() << nss.ns() << ChunkType::min() << min << ChunkType::max() << max
-                                 << ChunkType::shard()
-                                 << shard);
-        // Must use kLocalReadConcern because using majority will set a flag on the recovery unit
-        // that conflicts with the subsequent writes in the CommitChunkMigration command.
-        auto findResponse =
-            uassertStatusOK(grid.shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-                txn,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                repl::ReadConcernLevel::kLocalReadConcern,
-                NamespaceString(ChunkType::ConfigNS),
-                chunkQuery,
-                BSONObj(),
-                1));
-        uassert(40165,
-                str::stream()
-                    << "Could not find the chunk ("
-                    << chunkQuery.toString()
-                    << ") on the shard. Cannot execute the migration commit with invalid chunks.",
-                !findResponse.docs.empty());
-    }
-
-    BSONObj makeCommitChunkApplyOpsCommand(
-        const NamespaceString& nss,
-        const StatusWith<ChunkRange>& migratedChunkRange,
-        const boost::optional<StatusWith<ChunkRange>>& controlChunkRange,
-        const ChunkVersion newMigratedChunkVersion,
-        const boost::optional<ChunkVersion> newControlChunkVersion,
-        StringData toShard,
-        StringData fromShard) {
-        // Update migratedChunk's version and shard.
-        BSONArrayBuilder updates;
-        {
-            BSONObjBuilder op;
-            op.append("op", "u");
-            op.appendBool("b", false);  // No upserting
-            op.append("ns", ChunkType::ConfigNS);
-
-            BSONObjBuilder n(op.subobjStart("o"));
-            n.append(ChunkType::name(),
-                     ChunkType::genID(nss.ns(), migratedChunkRange.getValue().getMin()));
-            newMigratedChunkVersion.addToBSON(n, ChunkType::DEPRECATED_lastmod());
-            n.append(ChunkType::ns(), nss.ns());
-            n.append(ChunkType::min(), migratedChunkRange.getValue().getMin());
-            n.append(ChunkType::max(), migratedChunkRange.getValue().getMax());
-            n.append(ChunkType::shard(), toShard);
-            n.done();
-
-            BSONObjBuilder q(op.subobjStart("o2"));
-            q.append(ChunkType::name(),
-                     ChunkType::genID(nss.ns(), migratedChunkRange.getValue().getMin()));
-            q.done();
-
-            updates.append(op.obj());
-        }
-
-        // If we have a controlChunk, update its chunk version.
-        if (controlChunkRange) {
-            BSONObjBuilder op;
-            op.append("op", "u");
-            op.appendBool("b", false);
-            op.append("ns", ChunkType::ConfigNS);
-
-            BSONObjBuilder n(op.subobjStart("o"));
-            n.append(ChunkType::name(),
-                     ChunkType::genID(nss.ns(), controlChunkRange->getValue().getMin()));
-            newControlChunkVersion->addToBSON(n, ChunkType::DEPRECATED_lastmod());
-            n.append(ChunkType::ns(), nss.ns());
-            n.append(ChunkType::min(), controlChunkRange->getValue().getMin());
-            n.append(ChunkType::max(), controlChunkRange->getValue().getMax());
-            n.append(ChunkType::shard(), fromShard);
-            n.done();
-
-            BSONObjBuilder q(op.subobjStart("o2"));
-            q.append(ChunkType::name(),
-                     ChunkType::genID(nss.ns(), controlChunkRange->getValue().getMin()));
-            q.done();
-
-            updates.append(op.obj());
-        }
-
-        // Do not give applyOps a write concern. If applyOps tries to wait for replication, it will
-        // fail because of the GlobalWrite lock CommitChunkMigration already holds. Replication will
-        // not be able to take the lock it requires.
-        return BSON("applyOps" << updates.arr());
-    }
-
     bool run(OperationContext* txn,
              const std::string& dbName,
              BSONObj& cmdObj,
              int options,
              std::string& errmsg,
              BSONObjBuilder& result) override {
+
         const NamespaceString nss = NamespaceString(parseNs(dbName, cmdObj));
-        std::string fromShard = extractString(cmdObj, "fromShard");
-        std::string toShard = extractString(cmdObj, "toShard");
 
-        BSONObj migratedChunkField = uassertStatusOK(getBSONField(cmdObj, "migratedChunk"));
-        StatusWith<ChunkRange> migratedChunkRange = ChunkRange::fromBSON(migratedChunkField);
-        uassert(migratedChunkRange.getStatus().code(),
-                str::stream() << "Failed to parse 'migratedChunk' field in "
-                              << "ConfigSvrCommitChunkMigration command request: "
-                              << migratedChunkRange.getStatus().reason(),
-                migratedChunkRange.isOK());
+        auto commitRequest =
+            uassertStatusOK(CommitChunkMigrationRequest::createFromCommand(nss, cmdObj));
 
-        // controlChunk is optional, so parse it if present.
-        boost::optional<StatusWith<ChunkRange>> controlChunkRange = boost::none;
-        if (cmdObj.hasField("controlChunk")) {
-            BSONObj controlChunkField = uassertStatusOK(getBSONField(cmdObj, "controlChunk"));
-            controlChunkRange = ChunkRange::fromBSON(controlChunkField);
-            uassert(controlChunkRange->getStatus().code(),
-                    str::stream()
-                        << "Failed to parse 'controlChunk' field in ConfigSvrCommitChunkMigration "
-                        << "command request: "
-                        << controlChunkRange->getStatus().reason(),
-                    controlChunkRange->isOK());
-        }
-
-        // Run operations under a nested lock as a hack to prevent yielding. When query/applyOps
-        // commands are called, they will take a second lock, and the PlanExecutor will be unable to
-        // yield.
-        //
-        // ConfigSvrCommitChunkMigration commands must be run serially because the new ChunkVersions
-        // for migrated chunks are generated within the command. Therefore it cannot be allowed to
-        // yield between generating the ChunkVersion and committing it to the database with
-        // applyOps.
-        Lock::GlobalWrite firstGlobalWriteLock(txn->lockState());
-
-        // Check that migratedChunk and controlChunk are where they should be, on fromShard.
-        checkChunkIsOnShard(txn,
-                            nss,
-                            migratedChunkRange.getValue().getMin(),
-                            migratedChunkRange.getValue().getMax(),
-                            fromShard);
-        if (controlChunkRange) {
-            checkChunkIsOnShard(txn,
-                                nss,
-                                controlChunkRange->getValue().getMin(),
-                                controlChunkRange->getValue().getMax(),
-                                fromShard);
-        }
-
-        // Generate the new chunk version (CV). Query the current max CV of the collection. Use the
-        // incremented major version of the result returned. Migrating chunk's minor version will
-        // be 0, control chunk's minor version will be 1 (if control chunk is present).
-
-        // Must use kLocalReadConcern because using majority will set a flag on the recovery unit
-        // that conflicts with the subsequent writes.
-        auto findResponse =
-            uassertStatusOK(grid.shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-                txn,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                repl::ReadConcernLevel::kLocalReadConcern,
-                NamespaceString(ChunkType::ConfigNS),
-                BSON("ns" << nss.ns()),
-                BSON(ChunkType::DEPRECATED_lastmod << -1),
-                1));
-
-        std::vector<BSONObj> chunksVector = findResponse.docs;
-        uassert(40164,
-                str::stream() << "Tried to find max chunk version for collection '" << nss.ns()
-                              << ", but found no chunks",
-                !chunksVector.empty());
-
-        ChunkVersion currentMaxVersion =
-            ChunkVersion::fromBSON(chunksVector.front(), ChunkType::DEPRECATED_lastmod());
-
-        // Generate the new versions of migratedChunk and controlChunk.
-        ChunkVersion newMigratedChunkVersion =
-            ChunkVersion(currentMaxVersion.majorVersion() + 1, 0, currentMaxVersion.epoch());
-        boost::optional<ChunkVersion> newControlChunkVersion = boost::none;
-        if (controlChunkRange) {
-            newControlChunkVersion =
-                ChunkVersion(currentMaxVersion.majorVersion() + 1, 1, currentMaxVersion.epoch());
-        }
-
-        auto applyOpsCommandResponse = grid.shardRegistry()->getConfigShard()->runCommand(
+        StatusWith<BSONObj> response = Grid::get(txn)->catalogManager()->commitChunkMigration(
             txn,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            nss.db().toString(),
-            makeCommitChunkApplyOpsCommand(nss,
-                                           migratedChunkRange,
-                                           controlChunkRange,
-                                           newMigratedChunkVersion,
-                                           newControlChunkVersion,
-                                           toShard,
-                                           fromShard),
-            Shard::RetryPolicy::kIdempotent);
-
-        if (!applyOpsCommandResponse.isOK()) {
-            return appendCommandStatus(result, applyOpsCommandResponse.getStatus());
+            nss,
+            commitRequest.getMigratedChunk(),
+            commitRequest.getControlChunk(),
+            commitRequest.getCollectionEpoch(),
+            commitRequest.getFromShard(),
+            commitRequest.getToShard());
+        if (!response.isOK()) {
+            return appendCommandStatus(result, response.getStatus());
         }
-
-        if (!applyOpsCommandResponse.getValue().commandStatus.isOK()) {
-            return appendCommandStatus(result, applyOpsCommandResponse.getValue().commandStatus);
-        }
-
-        newMigratedChunkVersion.appendWithFieldForCommands(&result, "migratedChunkVersion");
-        if (controlChunkRange) {
-            newControlChunkVersion->appendWithFieldForCommands(&result, "controlChunkVersion");
-        }
-
+        result.appendElements(response.getValue());
         return true;
     }
 

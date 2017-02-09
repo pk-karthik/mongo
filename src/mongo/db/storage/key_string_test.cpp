@@ -40,10 +40,14 @@
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/bsonobj_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/config.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/future.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
@@ -85,7 +89,7 @@ TEST_F(KeyStringTest, Simple1) {
     BSONObj a = BSON("" << 5);
     BSONObj b = BSON("" << 6);
 
-    ASSERT_LESS_THAN(a, b);
+    ASSERT_BSONOBJ_LT(a, b);
 
     ASSERT_LESS_THAN(KeyString(version, a, ALL_ASCENDING, RecordId()),
                      KeyString(version, b, ALL_ASCENDING, RecordId()));
@@ -96,7 +100,7 @@ TEST_F(KeyStringTest, Simple1) {
         const BSONObj _orig = x;                       \
         const KeyString _ks(version, _orig, order);    \
         const BSONObj _converted = toBson(_ks, order); \
-        ASSERT_EQ(_converted, _orig);                  \
+        ASSERT_BSONOBJ_EQ(_converted, _orig);          \
         ASSERT(_converted.binaryEqual(_orig));         \
     } while (0)
 
@@ -106,27 +110,27 @@ TEST_F(KeyStringTest, Simple1) {
         ROUNDTRIP_ORDER(version, x, ONE_DESCENDING); \
     } while (0)
 
-#define COMPARES_SAME(_v, _x, _y)              \
-    do {                                       \
-        KeyString _xKS(_v, _x, ONE_ASCENDING); \
-        KeyString _yKS(_v, _y, ONE_ASCENDING); \
-        if (_x == _y) {                        \
-            ASSERT_EQUALS(_xKS, _yKS);         \
-        } else if (_x < _y) {                  \
-            ASSERT_LESS_THAN(_xKS, _yKS);      \
-        } else {                               \
-            ASSERT_LESS_THAN(_yKS, _xKS);      \
-        }                                      \
-                                               \
-        _xKS.resetToKey(_x, ONE_DESCENDING);   \
-        _yKS.resetToKey(_y, ONE_DESCENDING);   \
-        if (_x == _y) {                        \
-            ASSERT_EQUALS(_xKS, _yKS);         \
-        } else if (_x < _y) {                  \
-            ASSERT_GREATER_THAN(_xKS, _yKS);   \
-        } else {                               \
-            ASSERT_GREATER_THAN(_yKS, _xKS);   \
-        }                                      \
+#define COMPARES_SAME(_v, _x, _y)                                          \
+    do {                                                                   \
+        KeyString _xKS(_v, _x, ONE_ASCENDING);                             \
+        KeyString _yKS(_v, _y, ONE_ASCENDING);                             \
+        if (SimpleBSONObjComparator::kInstance.evaluate(_x == _y)) {       \
+            ASSERT_EQUALS(_xKS, _yKS);                                     \
+        } else if (SimpleBSONObjComparator::kInstance.evaluate(_x < _y)) { \
+            ASSERT_LESS_THAN(_xKS, _yKS);                                  \
+        } else {                                                           \
+            ASSERT_LESS_THAN(_yKS, _xKS);                                  \
+        }                                                                  \
+                                                                           \
+        _xKS.resetToKey(_x, ONE_DESCENDING);                               \
+        _yKS.resetToKey(_y, ONE_DESCENDING);                               \
+        if (SimpleBSONObjComparator::kInstance.evaluate(_x == _y)) {       \
+            ASSERT_EQUALS(_xKS, _yKS);                                     \
+        } else if (SimpleBSONObjComparator::kInstance.evaluate(_x < _y)) { \
+            ASSERT_GREATER_THAN(_xKS, _yKS);                               \
+        } else {                                                           \
+            ASSERT_GREATER_THAN(_yKS, _xKS);                               \
+        }                                                                  \
     } while (0)
 
 TEST_F(KeyStringTest, ActualBytesDouble) {
@@ -332,6 +336,9 @@ TEST_F(KeyStringTest, DecimalNumbers) {
               BSON("" << Decimal128("0.2512388057698744585180135042133610E-6020")));  // 2**(-10000)
     ROUNDTRIP(V1, BSON("" << Decimal128("4.940656458412465441765687928682213E-324") << "" << 1));
     ROUNDTRIP(V1, BSON("" << Decimal128("-0.8289046058458094980903836776809409E-316")));
+
+    // Decimal inside sub-doc
+    ROUNDTRIP(V1, BSON("" << BSONNULL << "" << BSON("a" << Decimal128::kPositiveInfinity)));
 }
 
 TEST_F(KeyStringTest, LotsOfNumbers1) {
@@ -372,6 +379,51 @@ TEST_F(KeyStringTest, LotsOfNumbers2) {
     for (double i = -1100; i < 1100; i++) {
         double x = pow(2.1, i);
         ROUNDTRIP(version, BSON("" << x));
+    }
+}
+
+TEST_F(KeyStringTest, LotsOfNumbers3) {
+    std::vector<stdx::future<void>> futures;
+
+    for (double k = 0; k < 8; k++) {
+        futures.push_back(stdx::async(stdx::launch::async, [k, this] {
+
+            for (double i = -1100; i < 1100; i++) {
+                for (double j = 0; j < 52; j++) {
+                    const auto V1 = KeyString::Version::V1;
+                    Decimal128::RoundingPrecision roundingPrecisions[]{
+                        Decimal128::kRoundTo15Digits, Decimal128::kRoundTo34Digits};
+                    Decimal128::RoundingMode roundingModes[]{Decimal128::kRoundTowardNegative,
+                                                             Decimal128::kRoundTowardPositive};
+                    double x = pow(2, i);
+                    double y = pow(2, i - j);
+                    double z = pow(2, i - 53 + k);
+                    double bin = x + y - z;
+
+                    // In general NaNs don't roundtrip as we only store a single NaN, see the NaNs
+                    // test.
+                    if (std::isnan(bin))
+                        continue;
+
+                    ROUNDTRIP(version, BSON("" << bin));
+                    ROUNDTRIP(version, BSON("" << -bin));
+
+                    if (version < V1)
+                        continue;
+
+                    for (auto precision : roundingPrecisions) {
+                        for (auto mode : roundingModes) {
+                            Decimal128 rounded = Decimal128(bin, precision, mode);
+                            ROUNDTRIP(V1, BSON("" << rounded));
+                            ROUNDTRIP(V1, BSON("" << rounded.negate()));
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    for (auto&& future : futures) {
+        future.get();
     }
 }
 
@@ -430,9 +482,9 @@ TEST_F(KeyStringTest, Timestamp) {
         ROUNDTRIP(version, b);
         ROUNDTRIP(version, c);
 
-        ASSERT_LESS_THAN(a, b);
-        ASSERT_LESS_THAN(b, c);
-        ASSERT_LESS_THAN(c, d);
+        ASSERT_BSONOBJ_LT(a, b);
+        ASSERT_BSONOBJ_LT(b, c);
+        ASSERT_BSONOBJ_LT(c, d);
 
         KeyString ka(version, a, ALL_ASCENDING);
         KeyString kb(version, b, ALL_ASCENDING);
@@ -677,6 +729,13 @@ const std::vector<BSONObj>& getInterestingElements(KeyString::Version version) {
         elements.push_back(BSON("" << Decimal128("0.1000000000000000055511151231257827")));
         elements.push_back(BSON("" << Decimal128("0.1000000000000000055511151231257828")));
 
+        // Decimals that failed at some point during testing.
+        elements.push_back(BSON("" << Decimal128("0.999999999999999")));
+        elements.push_back(BSON("" << Decimal128("2.22507385850721E-308")));
+        elements.push_back(BSON("" << Decimal128("9.881312916824930883531375857364428E-324")));
+        elements.push_back(BSON("" << Decimal128(9223372036854776000.0)));
+        elements.push_back(BSON("" << Decimal128("9223372036854776000")));
+
         // Numbers close to numerical underflow/overflow for double.
         elements.push_back(BSON("" << Decimal128("1.797693134862315708145274237317044E308")));
         elements.push_back(BSON("" << Decimal128("1.797693134862315708145274237317043E308")));
@@ -707,66 +766,78 @@ void testPermutation(KeyString::Version version,
     // Since KeyStrings are compared using memcmp we can assume it provides a total ordering such
     // that there won't be cases where (a < b && b < c && !(a < c)). This test still needs to ensure
     // that it provides the *correct* total ordering.
+    std::vector<stdx::future<void>> futures;
     for (size_t k = 0; k < orderings.size(); k++) {
-        BSONObj orderObj = orderings[k];
-        Ordering ordering = Ordering::make(orderObj);
-        if (debug)
-            log() << "ordering: " << orderObj;
-
-        std::vector<BSONObj> elements = elementsOrig;
-        std::stable_sort(elements.begin(), elements.end(), BSONObjCmp(orderObj));
-
-        for (size_t i = 0; i < elements.size(); i++) {
-            const BSONObj& o1 = elements[i];
-            if (debug)
-                log() << "\to1: " << o1;
-            ROUNDTRIP_ORDER(version, o1, ordering);
-
-            KeyString k1(version, o1, ordering);
-
-            KeyString l1(version, BSON("l" << o1.firstElement()), ordering);  // kLess
-            KeyString g1(version, BSON("g" << o1.firstElement()), ordering);  // kGreater
-            ASSERT_LT(l1, k1);
-            ASSERT_GT(g1, k1);
-
-            if (i + 1 < elements.size()) {
-                const BSONObj& o2 = elements[i + 1];
+        futures.push_back(
+            stdx::async(stdx::launch::async, [k, version, elementsOrig, orderings, debug] {
+                BSONObj orderObj = orderings[k];
+                Ordering ordering = Ordering::make(orderObj);
                 if (debug)
-                    log() << "\t\t o2: " << o2;
-                KeyString k2(version, o2, ordering);
-                KeyString g2(version, BSON("g" << o2.firstElement()), ordering);
-                KeyString l2(version, BSON("l" << o2.firstElement()), ordering);
+                    log() << "ordering: " << orderObj;
 
-                int bsonCmp = o1.woCompare(o2, ordering);
-                invariant(bsonCmp <= 0);  // We should be sorted...
+                std::vector<BSONObj> elements = elementsOrig;
+                BSONObjComparator bsonCmp(orderObj,
+                                          BSONObjComparator::FieldNamesMode::kConsider,
+                                          &SimpleStringDataComparator::kInstance);
+                std::stable_sort(elements.begin(), elements.end(), bsonCmp.makeLessThan());
 
-                if (bsonCmp == 0) {
-                    ASSERT_EQ(k1, k2);
-                } else {
-                    ASSERT_LT(k1, k2);
+                for (size_t i = 0; i < elements.size(); i++) {
+                    const BSONObj& o1 = elements[i];
+                    if (debug)
+                        log() << "\to1: " << o1;
+                    ROUNDTRIP_ORDER(version, o1, ordering);
+
+                    KeyString k1(version, o1, ordering);
+
+                    KeyString l1(version, BSON("l" << o1.firstElement()), ordering);  // kLess
+                    KeyString g1(version, BSON("g" << o1.firstElement()), ordering);  // kGreater
+                    ASSERT_LT(l1, k1);
+                    ASSERT_GT(g1, k1);
+
+                    if (i + 1 < elements.size()) {
+                        const BSONObj& o2 = elements[i + 1];
+                        if (debug)
+                            log() << "\t\t o2: " << o2;
+                        KeyString k2(version, o2, ordering);
+                        KeyString g2(version, BSON("g" << o2.firstElement()), ordering);
+                        KeyString l2(version, BSON("l" << o2.firstElement()), ordering);
+
+                        int bsonCmp = o1.woCompare(o2, ordering);
+                        invariant(bsonCmp <= 0);  // We should be sorted...
+
+                        if (bsonCmp == 0) {
+                            ASSERT_EQ(k1, k2);
+                        } else {
+                            ASSERT_LT(k1, k2);
+                        }
+
+                        // Test the query encodings using kLess and kGreater
+                        int firstElementComp = o1.firstElement().woCompare(o2.firstElement());
+                        if (ordering.descending(1))
+                            firstElementComp = -firstElementComp;
+
+                        invariant(firstElementComp <= 0);
+
+                        if (firstElementComp == 0) {
+                            // If they share a first element then l1/g1 should equal l2/g2 and l1
+                            // should
+                            // be
+                            // less than both and g1 should be greater than both.
+                            ASSERT_EQ(l1, l2);
+                            ASSERT_EQ(g1, g2);
+                            ASSERT_LT(l1, k2);
+                            ASSERT_GT(g1, k2);
+                        } else {
+                            // k1 is less than k2. Less(k2) and Greater(k1) should be between them.
+                            ASSERT_LT(g1, k2);
+                            ASSERT_GT(l2, k1);
+                        }
+                    }
                 }
-
-                // Test the query encodings using kLess and kGreater
-                int firstElementComp = o1.firstElement().woCompare(o2.firstElement());
-                if (ordering.descending(1))
-                    firstElementComp = -firstElementComp;
-
-                invariant(firstElementComp <= 0);
-
-                if (firstElementComp == 0) {
-                    // If they share a first element then l1/g1 should equal l2/g2 and l1 should be
-                    // less than both and g1 should be greater than both.
-                    ASSERT_EQ(l1, l2);
-                    ASSERT_EQ(g1, g2);
-                    ASSERT_LT(l1, k2);
-                    ASSERT_GT(g1, k2);
-                } else {
-                    // k1 is less than k2. Less(k2) and Greater(k1) should be between them.
-                    ASSERT_LT(g1, k2);
-                    ASSERT_GT(l2, k1);
-                }
-            }
-        }
+            }));
+    }
+    for (auto&& future : futures) {
+        future.get();
     }
 }
 
@@ -858,7 +929,8 @@ TEST_F(KeyStringTest, NaNs) {
     const double nan1 = std::numeric_limits<double>::quiet_NaN();
     const double nan2 = std::numeric_limits<double>::signaling_NaN();
 
-    // Since only output a single NaN, we can't use the normal ROUNDTRIP testing here.
+    // Since we only output a single NaN, we can only do ROUNDTRIP testing for nan1.
+    ROUNDTRIP(version, BSON("" << nan1));
 
     const KeyString ks1a(version, BSON("" << nan1), ONE_ASCENDING);
     const KeyString ks1d(version, BSON("" << nan1), ONE_DESCENDING);
@@ -1016,9 +1088,19 @@ TEST_F(KeyStringTest, RecordIds) {
 }
 
 namespace {
-const uint64_t kMinPerfMicros = 10 * 1000;
-const uint64_t kMinPerfSamples = 10 * 1000;
+const uint64_t kMinPerfMicros = 20 * 1000;
+const uint64_t kMinPerfSamples = 50 * 1000;
 typedef std::vector<BSONObj> Numbers;
+
+std::random_device rd;
+std::mt19937 seedGen(rd());
+
+// To be used by perf test for seeding, so that the entire test is repeatable in case of error.
+unsigned newSeed() {
+    unsigned int seed = seedGen();  // Replace by the reported number to repeat test execution.
+    log() << "Initializing random number generator using seed " << seed;
+    return seed;
+};
 
 /**
  * Evaluates ROUNDTRIP on all items in Numbers a sufficient number of times to take at least
@@ -1027,7 +1109,7 @@ typedef std::vector<BSONObj> Numbers;
 void perfTest(KeyString::Version version, const Numbers& numbers) {
     uint64_t micros = 0;
     uint64_t iters;
-    // Ensure at least 16 iterations are done and at least 25 milliseconds is timed
+    // Ensure at least 16 iterations are done and at least 50 milliseconds is timed
     for (iters = 16; iters < (1 << 30) && micros < kMinPerfMicros; iters *= 2) {
         // Measure the number of loops
         Timer t;
@@ -1044,7 +1126,8 @@ void perfTest(KeyString::Version version, const Numbers& numbers) {
         micros = t.micros();
     }
 
-    auto minmax = std::minmax_element(numbers.begin(), numbers.end());
+    auto minmax = std::minmax_element(
+        numbers.begin(), numbers.end(), SimpleBSONObjComparator::kInstance.makeLessThan());
 
     log() << 1E3 * micros / static_cast<double>(iters * numbers.size()) << " ns per "
           << mongo::KeyString::versionToString(version) << " roundtrip"
@@ -1055,8 +1138,7 @@ void perfTest(KeyString::Version version, const Numbers& numbers) {
 
 TEST_F(KeyStringTest, CommonIntPerf) {
     // Exponential distribution, so skewed towards smaller integers.
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::exponential_distribution<double> expReal(1e-3);
 
     std::vector<BSONObj> numbers;
@@ -1068,8 +1150,7 @@ TEST_F(KeyStringTest, CommonIntPerf) {
 
 TEST_F(KeyStringTest, UniformInt64Perf) {
     std::vector<BSONObj> numbers;
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::uniform_int_distribution<long long> uniformInt64(std::numeric_limits<long long>::min(),
                                                           std::numeric_limits<long long>::max());
 
@@ -1080,8 +1161,7 @@ TEST_F(KeyStringTest, UniformInt64Perf) {
 }
 
 TEST_F(KeyStringTest, CommonDoublePerf) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::exponential_distribution<double> expReal(1e-3);
 
     std::vector<BSONObj> numbers;
@@ -1093,8 +1173,7 @@ TEST_F(KeyStringTest, CommonDoublePerf) {
 
 TEST_F(KeyStringTest, UniformDoublePerf) {
     std::vector<BSONObj> numbers;
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::uniform_int_distribution<long long> uniformInt64(std::numeric_limits<long long>::min(),
                                                           std::numeric_limits<long long>::max());
 
@@ -1109,8 +1188,7 @@ TEST_F(KeyStringTest, UniformDoublePerf) {
 }
 
 TEST_F(KeyStringTest, CommonDecimalPerf) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::exponential_distribution<double> expReal(1e-3);
 
     if (version == KeyString::Version::V0)
@@ -1127,8 +1205,7 @@ TEST_F(KeyStringTest, CommonDecimalPerf) {
 }
 
 TEST_F(KeyStringTest, UniformDecimalPerf) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(newSeed());
     std::uniform_int_distribution<long long> uniformInt64(std::numeric_limits<long long>::min(),
                                                           std::numeric_limits<long long>::max());
 
@@ -1142,6 +1219,33 @@ TEST_F(KeyStringTest, UniformDecimalPerf) {
         Decimal128 d(Decimal128::Value{lo, hi});
         if (!d.isZero() && !d.isNaN() && !d.isInfinite())
             numbers.push_back(BSON("" << d));
+    }
+    perfTest(version, numbers);
+}
+
+TEST_F(KeyStringTest, DecimalFromUniformDoublePerf) {
+    std::vector<BSONObj> numbers;
+    std::mt19937 gen(newSeed());
+    std::uniform_int_distribution<long long> uniformInt64(std::numeric_limits<long long>::min(),
+                                                          std::numeric_limits<long long>::max());
+
+    if (version == KeyString::Version::V0)
+        return;
+
+    // In addition to serve as a data ponit for performance, this test also generates many decimal
+    // values close to binary floating point numbers, so edge cases around 15-digit approximations
+    // get extra randomized coverage over time.
+    for (uint64_t x = 0; x < kMinPerfSamples; x++) {
+        uint64_t u = uniformInt64(gen);
+        double d;
+        memcpy(&d, &u, sizeof(d));
+        if (!std::isnan(d)) {
+            Decimal128::RoundingMode mode =
+                x & 1 ? Decimal128::kRoundTowardPositive : Decimal128::kRoundTowardNegative;
+            Decimal128::RoundingPrecision prec =
+                x & 2 ? Decimal128::kRoundTo15Digits : Decimal128::kRoundTo34Digits;
+            numbers.push_back(BSON("" << Decimal128(d, prec, mode)));
+        }
     }
     perfTest(version, numbers);
 }

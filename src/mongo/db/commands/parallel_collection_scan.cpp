@@ -36,6 +36,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
@@ -73,7 +74,7 @@ public:
         return ReadWriteType::kCommand;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         ActionSet actions;
@@ -90,9 +91,9 @@ public:
                      int options,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
-        AutoGetCollectionForRead ctx(txn, ns.ns());
+        AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
         if (!collection)
@@ -147,17 +148,17 @@ public:
                 exec->saveState();
                 exec->detachFromOperationContext();
 
-                // transfer ownership of an executor to the ClientCursor (which manages its own
-                // lifetime).
-                ClientCursor* cc =
-                    new ClientCursor(collection->getCursorManager(),
-                                     exec.release(),
-                                     ns.ns(),
-                                     txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
-                cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
+                // Create and regiter a new ClientCursor.
+                auto pinnedCursor = collection->getCursorManager()->registerCursor(
+                    {exec.release(),
+                     ns.ns(),
+                     txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot()});
+                pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
+                    txn->getRemainingMaxTimeMicros());
 
                 BSONObjBuilder threadResult;
-                appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &threadResult);
+                appendCursorResponseObject(
+                    pinnedCursor.getCursor()->cursorid(), ns.ns(), BSONArray(), &threadResult);
                 threadResult.appendBool("ok", 1);
 
                 bucketsBuilder.append(threadResult.obj());

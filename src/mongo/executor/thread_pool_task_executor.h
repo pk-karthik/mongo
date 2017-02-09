@@ -68,7 +68,7 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
-    std::string getDiagnosticString() override;
+    std::string getDiagnosticString() const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
@@ -82,11 +82,6 @@ public:
     void wait(const CallbackHandle& cbHandle) override;
 
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
-
-    /**
-     * Cancels all commands on the network interface.
-     */
-    void cancelAllCommands();
 
 private:
     class CallbackState;
@@ -147,6 +142,11 @@ private:
      */
     void runCallback(std::shared_ptr<CallbackState> cbState);
 
+    /**
+     * Returns bson for diagnostics
+     */
+    BSONObj _getDiagnosticBSON() const;
+
     // The network interface used for remote command execution and waiting.
     std::unique_ptr<NetworkInterface> _net;
 
@@ -154,7 +154,7 @@ private:
     std::unique_ptr<ThreadPoolInterface> _pool;
 
     // Mutex guarding all remaining fields.
-    stdx::mutex _mutex;
+    mutable stdx::mutex _mutex;
 
     // Queue containing all items currently scheduled into the thread pool but not yet completed.
     WorkQueue _poolInProgressQueue;

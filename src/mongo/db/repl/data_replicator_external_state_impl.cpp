@@ -49,6 +49,10 @@ executor::TaskExecutor* DataReplicatorExternalStateImpl::getTaskExecutor() const
     return _replicationCoordinatorExternalState->getTaskExecutor();
 }
 
+OldThreadPool* DataReplicatorExternalStateImpl::getDbWorkThreadPool() const {
+    return _replicationCoordinatorExternalState->getDbWorkThreadPool();
+}
+
 OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOpTime() {
     if (!_replicationCoordinator->isV1ElectionProtocol()) {
         return {OpTime::kUninitializedTerm, OpTime()};
@@ -57,7 +61,7 @@ OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOp
 }
 
 void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata& metadata) {
-    _replicationCoordinator->processReplSetMetadata(metadata);
+    _replicationCoordinator->processReplSetMetadata(metadata, true /*advance the commit point*/);
     if (metadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary) {
         _replicationCoordinator->cancelAndRescheduleElectionTimeout();
     }
@@ -67,9 +71,10 @@ bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& sour
                                                          const rpc::ReplSetMetadata& metadata) {
     // Re-evaluate quality of sync target.
     if (_replicationCoordinator->shouldChangeSyncSource(source, metadata)) {
-        LOG(1) << "Canceling oplog query because we have to choose a sync source. Current source: "
-               << source << ", OpTime " << metadata.getLastOpVisible()
-               << ", its sync source index:" << metadata.getSyncSourceIndex();
+        log()
+            << "Canceling oplog query because we have to choose a new sync source. Current source: "
+            << source << ", OpTime " << metadata.getLastOpVisible()
+            << ", its sync source index:" << metadata.getSyncSourceIndex();
         return true;
     }
     return false;
@@ -96,13 +101,14 @@ StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
     return _replicationCoordinatorExternalState->multiApply(txn, std::move(ops), applyOperation);
 }
 
-void DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationPtrs* ops) {
-    _replicationCoordinatorExternalState->multiSyncApply(ops);
+Status DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationPtrs* ops) {
+    return _replicationCoordinatorExternalState->multiSyncApply(ops);
 }
 
-void DataReplicatorExternalStateImpl::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                                             const HostAndPort& source) {
-    _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source);
+Status DataReplicatorExternalStateImpl::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                                               const HostAndPort& source,
+                                                               AtomicUInt32* fetchCount) {
+    return _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source, fetchCount);
 }
 
 ReplicationCoordinator* DataReplicatorExternalStateImpl::getReplicationCoordinator() const {

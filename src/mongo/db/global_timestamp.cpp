@@ -28,6 +28,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/global_timestamp.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
@@ -41,7 +43,8 @@ namespace {
 AtomicUInt64 globalTimestamp(0);
 }  // namespace
 
-void setGlobalTimestamp(const Timestamp& newTime) {
+void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime) {
+    // TODO: SERVER-27746 replace with LogicalTime
     globalTimestamp.store(newTime.asULL() + 1);
 }
 
@@ -49,7 +52,8 @@ Timestamp getLastSetTimestamp() {
     return Timestamp(globalTimestamp.load() - 1);
 }
 
-Timestamp getNextGlobalTimestamp(unsigned count) {
+Timestamp getNextGlobalTimestamp(ServiceContext* service, unsigned count) {
+    // TODO: SERVER-27746 replace with LogicalTime
     const unsigned now = durationCount<Seconds>(
         getGlobalServiceContext()->getFastClockSource()->now().toDurationSinceEpoch());
     invariant(now != 0);  // This is a sentinel value for null Timestamps.

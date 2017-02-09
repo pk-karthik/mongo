@@ -28,15 +28,15 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/scopeguard.h"
 
@@ -46,32 +46,26 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::string;
 
-DocumentSourceCursor::~DocumentSourceCursor() {
-    dispose();
-}
-
 const char* DocumentSourceCursor::getSourceName() const {
     return "$cursor";
 }
 
-boost::optional<Document> DocumentSourceCursor::getNext() {
+DocumentSource::GetNextResult DocumentSourceCursor::getNext() {
     pExpCtx->checkForInterrupt();
 
     if (_currentBatch.empty()) {
         loadBatch();
 
-        if (_currentBatch.empty())  // exhausted the cursor
-            return boost::none;
+        if (_currentBatch.empty())
+            return GetNextResult::makeEOF();
     }
 
-    Document out = _currentBatch.front();
+    Document out = std::move(_currentBatch.front());
     _currentBatch.pop_front();
-    return out;
+    return std::move(out);
 }
 
 void DocumentSourceCursor::dispose() {
-    // Can't call in to PlanExecutor or ClientCursor registries from this function since it
-    // will be called when an agg cursor is killed which would cause a deadlock.
     _exec.reset();
     _currentBatch.clear();
 }
@@ -84,8 +78,7 @@ void DocumentSourceCursor::loadBatch() {
 
     // We have already validated the sharding version when we constructed the PlanExecutor
     // so we shouldn't check it again.
-    const NamespaceString nss(_ns);
-    AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
+    AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _nss);
 
     _exec->restoreState();
 
@@ -113,7 +106,7 @@ void DocumentSourceCursor::loadBatch() {
 
             memUsageBytes += _currentBatch.back().getApproximateSize();
 
-            if (memUsageBytes > FindCommon::kMaxBytesToReturnToClientAtOnce) {
+            if (memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
                 // End this batch and prepare PlanExecutor for yielding.
                 _exec->saveState();
                 return;
@@ -144,7 +137,7 @@ long long DocumentSourceCursor::getLimit() const {
     return _limit ? _limit->getLimit() : -1;
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceCursor::optimizeAt(
+Pipeline::SourceContainer::iterator DocumentSourceCursor::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
 
@@ -189,8 +182,7 @@ Value DocumentSourceCursor::serialize(bool explain) const {
     // Get planner-level explain info from the underlying PlanExecutor.
     BSONObjBuilder explainBuilder;
     {
-        const NamespaceString nss(_ns);
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _nss);
 
         massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
@@ -221,25 +213,44 @@ Value DocumentSourceCursor::serialize(bool explain) const {
     return Value(DOC(getSourceName() << out.freezeToValue()));
 }
 
-DocumentSourceCursor::DocumentSourceCursor(const string& ns,
-                                           const std::shared_ptr<PlanExecutor>& exec,
+void DocumentSourceCursor::detachFromOperationContext() {
+    if (_exec) {
+        _exec->detachFromOperationContext();
+    }
+}
+
+void DocumentSourceCursor::reattachToOperationContext(OperationContext* opCtx) {
+    if (_exec) {
+        _exec->reattachToOperationContext(opCtx);
+    }
+}
+
+DocumentSourceCursor::DocumentSourceCursor(Collection* collection,
+                                           const string& ns,
+                                           std::unique_ptr<PlanExecutor> exec,
                                            const intrusive_ptr<ExpressionContext>& pCtx)
     : DocumentSource(pCtx),
       _docsAddedToBatches(0),
-      _ns(ns),
-      _exec(exec),
-      _outputSorts(exec->getOutputSorts()) {
+      _nss(ns),
+      _exec(std::move(exec)),
+      _outputSorts(_exec->getOutputSorts()) {
     recordPlanSummaryStr();
 
     // We record execution metrics here to allow for capture of indexes used prior to execution.
     recordPlanSummaryStats();
+    if (collection) {
+        collection->infoCache()->notifyOfQuery(pCtx->opCtx, _planSummaryStats.indexesUsed);
+    }
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
+    Collection* collection,
     const string& ns,
-    const std::shared_ptr<PlanExecutor>& exec,
+    std::unique_ptr<PlanExecutor> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    return new DocumentSourceCursor(ns, exec, pExpCtx);
+    intrusive_ptr<DocumentSourceCursor> source(
+        new DocumentSourceCursor(collection, ns, std::move(exec), pExpCtx));
+    return source;
 }
 
 void DocumentSourceCursor::setProjection(const BSONObj& projection,

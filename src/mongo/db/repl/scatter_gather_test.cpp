@@ -61,7 +61,7 @@ public:
         std::vector<RemoteCommandRequest> requests;
         for (int i = 0; i < kTotalRequests; i++) {
             requests.push_back(RemoteCommandRequest(
-                HostAndPort("hostname", i), "admin", BSONObj(), Milliseconds(30 * 1000)));
+                HostAndPort("hostname", i), "admin", BSONObj(), nullptr, Milliseconds(30 * 1000)));
         }
         return requests;
     }
@@ -118,8 +118,9 @@ private:
 };
 
 void ScatterGatherTest::setUp() {
-    _net = new NetworkInterfaceMock;
-    _executor = stdx::make_unique<ReplicationExecutor>(_net, 1 /* prng seed */);
+    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    _net = net.get();
+    _executor = stdx::make_unique<ReplicationExecutor>(std::move(net), 1 /* prng seed */);
     _executorThread.reset(new stdx::thread(stdx::bind(&ReplicationExecutor::run, _executor.get())));
 }
 

@@ -481,9 +481,9 @@ std::string SolutionCacheData::toString() const {
 // PlanCache
 //
 
-PlanCache::PlanCache() : _cache(internalQueryCacheSize) {}
+PlanCache::PlanCache() : _cache(internalQueryCacheSize.load()) {}
 
-PlanCache::PlanCache(const std::string& ns) : _cache(internalQueryCacheSize), _ns(ns) {}
+PlanCache::PlanCache(const std::string& ns) : _cache(internalQueryCacheSize.load()), _ns(ns) {}
 
 PlanCache::~PlanCache() {}
 
@@ -605,7 +605,7 @@ void PlanCache::encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuild
          ++i) {
         const BSONElement& elt = (*i).second;
 
-        if (elt.isSimpleType()) {
+        if (elt.type() != BSONType::Object) {
             // For inclusion/exclusion projections, we encode as "i" or "e".
             *keyBuilder << (elt.trueValue() ? "i" : "e");
         } else {
@@ -665,7 +665,7 @@ Status PlanCache::add(const CanonicalQuery& query,
 
     if (NULL != evictedEntry.get()) {
         LOG(1) << _ns << ": plan cache maximum size exceeded - "
-               << "removed least recently used entry " << evictedEntry->toString();
+               << "removed least recently used entry " << redact(evictedEntry->toString());
     }
 
     return Status::OK();
@@ -704,7 +704,7 @@ Status PlanCache::feedback(const CanonicalQuery& cq, PlanCacheEntryFeedback* fee
     invariant(entry);
 
     // We store up to a constant number of feedback entries.
-    if (entry->feedback.size() < size_t(internalQueryCacheFeedbacksStored)) {
+    if (entry->feedback.size() < static_cast<size_t>(internalQueryCacheFeedbacksStored.load())) {
         entry->feedback.push_back(autoFeedback.release());
     }
 

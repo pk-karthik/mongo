@@ -38,7 +38,7 @@
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/catalog/replset/sharding_catalog_manager_impl.h"
+#include "mongo/s/catalog/sharding_catalog_manager_impl.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_remote.h"
@@ -89,8 +89,7 @@ Status initializeGlobalShardingStateForMongod(OperationContext* txn,
         [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor)
             -> std::unique_ptr<ShardingCatalogManager> {
                 if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                    return stdx::make_unique<ShardingCatalogManagerImpl>(catalogClient,
-                                                                         std::move(executor));
+                    return stdx::make_unique<ShardingCatalogManagerImpl>(std::move(executor));
                 } else {
                     return nullptr;  // Only config servers get a real ShardingCatalogManager
                 }

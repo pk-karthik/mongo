@@ -59,20 +59,20 @@ public:
      * without closing the builder. The builder must be empty, but callers are free to append more
      * fields once the command has been constructed.
      *
-     * The shardVersion argument is appended, but not parsed by the createFromCommand method above,
-     * because it is processed by the mongod generic command parsing code.
+     * The chunkVersion argument is appended as 'chunkVersion', but not parsed by the
+     * createFromCommand method above, because it is needed for backwards compatibility with 3.4.
+     * However, the 'epoch' field created from the chunkVersion argument is parsed.
      */
     static void appendAsCommand(BSONObjBuilder* builder,
                                 const NamespaceString& nss,
-                                const ChunkVersion& shardVersion,
+                                ChunkVersion chunkVersion,
                                 const ConnectionString& configServerConnectionString,
                                 const ShardId& fromShardId,
                                 const ShardId& toShardId,
                                 const ChunkRange& range,
                                 int64_t maxChunkSizeBytes,
                                 const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                bool waitForDelete,
-                                bool takeDistLock);
+                                bool waitForDelete);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -98,6 +98,10 @@ public:
         return _range.getMax();
     }
 
+    const OID getVersionEpoch() const {
+        return _versionEpoch;
+    }
+
     int64_t getMaxChunkSizeBytes() const {
         return _maxChunkSizeBytes;
     }
@@ -110,16 +114,17 @@ public:
         return _waitForDelete;
     }
 
-    bool getTakeDistLock() const {
-        return _takeDistLock;
-    }
-
     /**
      * Returns true if the requests match exactly in terms of the field values and the order of
      * elements within the BSON-typed fields.
      */
     bool operator==(const MoveChunkRequest& other) const;
     bool operator!=(const MoveChunkRequest& other) const;
+
+    /**
+     *  Print logging info for the request.
+     */
+    std::string toString() const;
 
 private:
     MoveChunkRequest(NamespaceString nss,
@@ -140,8 +145,11 @@ private:
     // The recipient shard id
     ShardId _toShardId;
 
-    // Range of chunk chunk being moved
+    // Range of the chunk being moved
     ChunkRange _range;
+
+    // Assures the collection has not been dropped and recreated since the moveChunk was sent.
+    OID _versionEpoch;
 
     // This value is used by the migration source to determine the data size threshold above which a
     // chunk would be considered jumbo and migrations will not proceed.
@@ -153,9 +161,6 @@ private:
     // Whether to block and wait for the range deleter to cleanup the orphaned documents at the end
     // of move.
     bool _waitForDelete;
-
-    // Whether to take the distributed lock for the collection or not.
-    bool _takeDistLock;
 };
 
 }  // namespace mongo

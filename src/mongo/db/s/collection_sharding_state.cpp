@@ -40,29 +40,38 @@
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_config_version.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/cluster_identity_loader.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
 namespace {
 
+using std::string;
+
 /**
  * Used to perform shard identity initialization once it is certain that the document is committed.
  */
-class ShardIdentityLopOpHandler final : public RecoveryUnit::Change {
+class ShardIdentityLogOpHandler final : public RecoveryUnit::Change {
 public:
-    ShardIdentityLopOpHandler(OperationContext* txn, ShardIdentityType shardIdentity)
+    ShardIdentityLogOpHandler(OperationContext* txn, ShardIdentityType shardIdentity)
         : _txn(txn), _shardIdentity(std::move(shardIdentity)) {}
 
     void commit() override {
         fassertNoTrace(40071,
-                       ShardingState::get(_txn)->initializeFromShardIdentity(
-                           _txn, _shardIdentity, Date_t::max()));
+                       ShardingState::get(_txn)->initializeFromShardIdentity(_txn, _shardIdentity));
     }
 
     void rollback() override {}
@@ -74,13 +83,8 @@ private:
 
 }  // unnamed namespace
 
-using std::string;
-
-CollectionShardingState::CollectionShardingState(
-    NamespaceString nss, std::unique_ptr<CollectionMetadata> initialMetadata)
-    : _nss(std::move(nss)), _metadataManager{} {
-    _metadataManager.setActiveMetadata(std::move(initialMetadata));
-}
+CollectionShardingState::CollectionShardingState(ServiceContext* sc, NamespaceString nss)
+    : _nss(std::move(nss)), _metadataManager{sc, _nss} {}
 
 CollectionShardingState::~CollectionShardingState() {
     invariant(!_sourceMgr);
@@ -97,19 +101,30 @@ CollectionShardingState* CollectionShardingState::get(OperationContext* txn,
     dassert(txn->lockState()->isCollectionLockedForMode(ns, MODE_IS));
 
     ShardingState* const shardingState = ShardingState::get(txn);
-    return shardingState->getNS(ns);
+    return shardingState->getNS(ns, txn);
 }
 
 ScopedCollectionMetadata CollectionShardingState::getMetadata() {
     return _metadataManager.getActiveMetadata();
 }
 
-void CollectionShardingState::setMetadata(std::unique_ptr<CollectionMetadata> newMetadata) {
-    if (newMetadata) {
-        invariant(!newMetadata->getCollVersion().isWriteCompatibleWith(ChunkVersion::UNSHARDED()));
-        invariant(!newMetadata->getShardVersion().isWriteCompatibleWith(ChunkVersion::UNSHARDED()));
-    }
-    _metadataManager.setActiveMetadata(std::move(newMetadata));
+void CollectionShardingState::refreshMetadata(OperationContext* txn,
+                                              std::unique_ptr<CollectionMetadata> newMetadata) {
+    invariant(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
+
+    _metadataManager.refreshActiveMetadata(std::move(newMetadata));
+}
+
+void CollectionShardingState::markNotShardedAtStepdown() {
+    _metadataManager.refreshActiveMetadata(nullptr);
+}
+
+void CollectionShardingState::beginReceive(const ChunkRange& range) {
+    _metadataManager.beginReceive(range);
+}
+
+void CollectionShardingState::forgetReceive(const ChunkRange& range) {
+    _metadataManager.forgetReceive(range);
 }
 
 MigrationSourceManager* CollectionShardingState::getMigrationSourceManager() {
@@ -145,6 +160,18 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* txn) {
     }
 }
 
+bool CollectionShardingState::collectionIsSharded() {
+    auto metadata = getMetadata().getMetadata();
+    if (metadata && (metadata->getCollVersion().isStrictlyEqualTo(ChunkVersion::UNSHARDED()))) {
+        return false;
+    }
+
+    // If 'metadata' is null, then the shard doesn't know if this collection is sharded or not. In
+    // this scenario we will assume this collection is sharded. We will know sharding state
+    // definitively once SERVER-24960 has been fixed.
+    return true;
+}
+
 bool CollectionShardingState::isDocumentInMigratingChunk(OperationContext* txn,
                                                          const BSONObj& doc) {
     dassert(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
@@ -164,8 +191,9 @@ void CollectionShardingState::onInsertOp(OperationContext* txn, const BSONObj& i
         if (auto idElem = insertedDoc["_id"]) {
             if (idElem.str() == ShardIdentityType::IdName) {
                 auto shardIdentityDoc = uassertStatusOK(ShardIdentityType::fromBSON(insertedDoc));
+                uassertStatusOK(shardIdentityDoc.validate());
                 txn->recoveryUnit()->registerChange(
-                    new ShardIdentityLopOpHandler(txn, std::move(shardIdentityDoc)));
+                    new ShardIdentityLogOpHandler(txn, std::move(shardIdentityDoc)));
             }
         }
     }
@@ -187,22 +215,74 @@ void CollectionShardingState::onUpdateOp(OperationContext* txn, const BSONObj& u
     }
 }
 
-void CollectionShardingState::onDeleteOp(OperationContext* txn, const BSONObj& deletedDocId) {
+void CollectionShardingState::onDeleteOp(OperationContext* txn,
+                                         const CollectionShardingState::DeleteState& deleteState) {
     dassert(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
 
-    if (txn->writesAreReplicated() && serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
         _nss == NamespaceString::kConfigCollectionNamespace) {
-        if (auto idElem = deletedDocId["_id"]) {
-            uassert(40070,
-                    "cannot delete shardIdentity document while in --shardsvr mode",
-                    idElem.str() != ShardIdentityType::IdName);
+
+        if (auto idElem = deleteState.idDoc["_id"]) {
+            auto idStr = idElem.str();
+            if (idStr == ShardIdentityType::IdName) {
+                if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                    uasserted(40070,
+                              "cannot delete shardIdentity document while in --shardsvr mode");
+                } else {
+                    warning() << "Shard identity document rolled back.  Will shut down after "
+                                 "finishing rollback.";
+                    ShardIdentityRollbackNotifier::get(txn)->recordThatRollbackHappened();
+                }
+            }
+        }
+    }
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (_nss == VersionType::ConfigNS) {
+            if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                uasserted(40302, "cannot delete config.version document while in --configsvr mode");
+            } else {
+                // Throw out any cached information related to the cluster ID.
+                Grid::get(txn)->catalogManager()->discardCachedConfigDatabaseInitializationState();
+                ClusterIdentityLoader::get(txn)->discardCachedClusterId();
+            }
         }
     }
 
     checkShardVersionOrThrow(txn);
 
-    if (_sourceMgr) {
-        _sourceMgr->getCloner()->onDeleteOp(txn, deletedDocId);
+    if (_sourceMgr && deleteState.isMigrating) {
+        _sourceMgr->getCloner()->onDeleteOp(txn, deleteState.idDoc);
+    }
+}
+
+void CollectionShardingState::onDropCollection(OperationContext* txn,
+                                               const NamespaceString& collectionName) {
+    dassert(txn->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+        _nss == NamespaceString::kConfigCollectionNamespace) {
+        // Dropping system collections is not allowed for end users.
+        invariant(!txn->writesAreReplicated());
+        invariant(repl::ReplicationCoordinator::get(txn)->getMemberState().rollback());
+
+        // Can't confirm whether there was a ShardIdentity document or not yet, so assume there was
+        // one and shut down the process to clear the in-memory sharding state.
+        warning() << "admin.system.version collection rolled back.  Will shut down after "
+                     "finishing rollback";
+        ShardIdentityRollbackNotifier::get(txn)->recordThatRollbackHappened();
+    }
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (_nss == VersionType::ConfigNS) {
+            if (!repl::ReplicationCoordinator::get(txn)->getMemberState().rollback()) {
+                uasserted(40303, "cannot drop config.version document while in --configsvr mode");
+            } else {
+                // Throw out any cached information related to the cluster ID.
+                Grid::get(txn)->catalogManager()->discardCachedConfigDatabaseInitializationState();
+                ClusterIdentityLoader::get(txn)->discardCachedClusterId();
+            }
+        }
     }
 }
 

@@ -42,7 +42,7 @@
         assert.eq(profileObj.originatingCommand.filter, {a: {$gt: 0}});
         assert.eq(profileObj.originatingCommand.sort, {a: 1});
     }
-    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1 }", tojson(profileObj));
     assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("responseLength"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));
@@ -52,6 +52,7 @@
     assert(profileObj.locks.hasOwnProperty("Collection"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("millis"), tojson(profileObj));
     assert(!profileObj.hasOwnProperty("cursorExhausted"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm hasSortStage on getMore with a not-exhausted cursor and in-memory sort.
@@ -88,6 +89,7 @@
            tojson(profileObj));  // cursorid should always be present on getMore.
     assert.neq(0, profileObj.cursorid, tojson(profileObj));
     assert.eq(profileObj.cursorExhausted, true, tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm getMore on aggregation.
@@ -98,7 +100,7 @@
     }
     assert.commandWorked(coll.createIndex({a: 1}));
 
-    var cursor = coll.aggregate([{$match: {a: {$gte: 0}}}], {cursor: {batchSize: 0}});
+    var cursor = coll.aggregate([{$match: {a: {$gte: 0}}}], {cursor: {batchSize: 0}, hint: {a: 1}});
     var cursorId = getLatestProfilerEntry(testDB).cursorid;
     assert.neq(0, cursorId);
 
@@ -115,8 +117,12 @@
     }
     assert.eq(profileObj.cursorid, cursorId, tojson(profileObj));
     assert.eq(profileObj.nreturned, 20, tojson(profileObj));
-    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1 }", tojson(profileObj));
     assert.eq(profileObj.cursorExhausted, true, tojson(profileObj));
     assert.eq(profileObj.keysExamined, 20, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 20, tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
+    if (!isLegacyReadMode) {
+        assert.eq(profileObj.originatingCommand.hint, {a: 1}, tojson(profileObj));
+    }
 })();

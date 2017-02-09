@@ -111,7 +111,13 @@ public:
      */
     class ResourceMutex {
     public:
-        ResourceMutex();
+        ResourceMutex(std::string resourceLabel);
+
+        std::string getName() const {
+            return getName(_rid);
+        };
+
+        static std::string getName(ResourceId resourceId);
 
     private:
         friend class Lock::SharedLock;
@@ -158,7 +164,6 @@ public:
     public:
         class EnqueueOnly {};
 
-        explicit GlobalLock(Locker* locker);
         GlobalLock(Locker* locker, LockMode lockMode, unsigned timeoutMs);
 
         /**
@@ -328,16 +333,19 @@ public:
      * Turn on "parallel batch writer mode" by locking the global ParallelBatchWriterMode
      * resource in exclusive mode. This mode is off by default.
      * Note that only one thread creates a ParallelBatchWriterMode object; the other batch
-     * writers just call setIsBatchWriter().
+     * writers just call setShouldConflictWithSecondaryBatchApplication(false).
      */
     class ParallelBatchWriterMode {
         MONGO_DISALLOW_COPYING(ParallelBatchWriterMode);
 
     public:
         explicit ParallelBatchWriterMode(Locker* lockState);
+        ~ParallelBatchWriterMode();
 
     private:
         ResourceLock _pbwm;
+        Locker* const _lockState;
+        const bool _orginalShouldConflict;
     };
 };
 

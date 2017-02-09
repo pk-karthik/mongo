@@ -36,14 +36,18 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/request_interface.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/string_map.h"
+
+// Included for the purpose of granting friendship to `execCommandClient` and `execCommandDatabase`
+#include "mongo/db/commands_helpers.h"
 
 namespace mongo {
 
@@ -216,12 +220,12 @@ public:
                            BSONObjBuilder* out) const;
 
     /**
-     * Checks if the given client is authorized to run this command on database "dbname"
-     * with the invocation described by "cmdObj".
+     * Checks if the client associated with the given OperationContext, "txn", is authorized to run
+     * this command on database "dbname" with the invocation described by "cmdObj".
      */
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj);
+    virtual Status checkAuthForOperation(OperationContext* txn,
+                                         const std::string& dbname,
+                                         const BSONObj& cmdObj);
 
     /**
      * Redacts "cmdObj" in-place to a form suitable for writing to logs.
@@ -281,18 +285,6 @@ public:
     }
 
 protected:
-    /**
-     * Appends to "*out" the privileges required to run this command on database "dbname" with
-     * the invocation described by "cmdObj".  New commands shouldn't implement this, they should
-     * implement checkAuthForCommand instead.
-     */
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        // The default implementation of addRequiredPrivileges should never be hit.
-        fassertFailed(16940);
-    }
-
     static CommandMap* _commands;
     static CommandMap* _commandsByBestName;
 
@@ -324,16 +316,13 @@ public:
                             const rpc::RequestInterface& request,
                             rpc::ReplyBuilderInterface* replyBuilder);
 
-    // For mongos
-    // TODO: remove this entirely now that all instances of ClientBasic are instances
-    // of Client. This will happen as part of SERVER-18292
-    static void execCommandClientBasic(OperationContext* txn,
-                                       Command* c,
-                                       Client& client,
-                                       int queryOptions,
-                                       const char* ns,
-                                       BSONObj& cmdObj,
-                                       BSONObjBuilder& result);
+    using ExecCommandHandler = decltype(Command::execCommand);
+
+    /**
+     * Registers the implementation of the `registerExecCommand` function. This must be called from
+     * a MONGO_INITIALIZER context and/or a single-threaded context.
+     */
+    static void registerExecCommand(stdx::function<ExecCommandHandler> handler);
 
     // Helper for setting errmsg and ok field in command result object.
     static void appendCommandStatus(BSONObjBuilder& result, bool ok, const std::string& errmsg);
@@ -440,24 +429,55 @@ public:
     static void registerError(OperationContext* txn, const DBException& exception);
 
     /**
+     * Registers the implementation of the `registerError` function. This hook is needed because
+     * mongos does not have CurOp linked in to it. This must be called from a MONGO_INITIALIZER
+     * context and/or a single-threaded context.
+     */
+    static void registerRegisterError(
+        stdx::function<void(OperationContext*, const DBException&)> registerErrorHandler);
+
+    /**
      * This function checks if a command is a user management command by name.
      */
     static bool isUserManagementCommand(const std::string& name);
 
-private:
     /**
-     * Checks to see if the client is authorized to run the given command with the given
-     * parameters on the given named database.
+     * Checks to see if the client executing "txn" is authorized to run the given command with the
+     * given parameters on the given named database.
      *
      * Returns Status::OK() if the command is authorized.  Most likely returns
      * ErrorCodes::Unauthorized otherwise, but any return other than Status::OK implies not
      * authorized.
      */
-    static Status _checkAuthorization(Command* c,
-                                      Client* client,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj);
+    static Status checkAuthorization(Command* c,
+                                     OperationContext* client,
+                                     const std::string& dbname,
+                                     const BSONObj& cmdObj);
 
+private:
+    /**
+     * Checks if the given client is authorized to run this command on database "dbname"
+     * with the invocation described by "cmdObj".
+     *
+     * NOTE: Implement checkAuthForOperation that takes an OperationContext* instead.
+     */
+    virtual Status checkAuthForCommand(Client* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj);
+
+    /**
+     * Appends to "*out" the privileges required to run this command on database "dbname" with
+     * the invocation described by "cmdObj".  New commands shouldn't implement this, they should
+     * implement checkAuthForOperation (which takes an OperationContext*), instead.
+     */
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        // The default implementation of addRequiredPrivileges should never be hit.
+        fassertFailed(16940);
+    }
+
+private:
     // The full name of the command
     const std::string _name;
 
@@ -467,6 +487,18 @@ private:
     // Pointers to hold the metrics tree references
     ServerStatusMetricField<Counter64> _commandsExecutedMetric;
     ServerStatusMetricField<Counter64> _commandsFailedMetric;
+
+    friend void mongo::execCommandClient(OperationContext* txn,
+                                         Command* c,
+                                         int queryOptions,
+                                         const char* ns,
+                                         BSONObj& cmdObj,
+                                         BSONObjBuilder& result);
+
+    friend void mongo::execCommandDatabase(OperationContext* txn,
+                                           Command* command,
+                                           const rpc::RequestInterface& request,
+                                           rpc::ReplyBuilderInterface* replyBuilder);
 };
 
 }  // namespace mongo

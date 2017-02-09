@@ -72,11 +72,19 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
                                                commandStyle) -> StatusWith<BSONObj> {
         auto currentSyncTarget = bgsync->getSyncTarget();
         if (currentSyncTarget != syncTarget) {
-            // Change in sync target
-            return Status(ErrorCodes::InvalidSyncSource, "Sync target is no longer valid");
+            if (currentSyncTarget.empty()) {
+                // Sync source was cleared.
+                return Status(ErrorCodes::InvalidSyncSource,
+                              str::stream() << "Sync source was cleared. Was " << syncTarget);
+
+            } else {
+                // Sync source changed.
+                return Status(ErrorCodes::InvalidSyncSource,
+                              str::stream() << "Sync source changed from " << syncTarget << " to "
+                                            << currentSyncTarget);
+            }
         }
 
-        stdx::lock_guard<stdx::mutex> lock(mtx);
         auto replCoord = repl::ReplicationCoordinator::get(txn);
         if (replCoord->getMemberState().primary()) {
             // Primary has no one to send updates to.
@@ -105,13 +113,9 @@ void SyncSourceFeedback::forwardSlaveProgress() {
     }
 }
 
-Status SyncSourceFeedback::_updateUpstream(OperationContext* txn, BackgroundSync* bgsync) {
-    Reporter* reporter;
-    {
-        stdx::lock_guard<stdx::mutex> lock(_mtx);
-        reporter = _reporter;
-    }
-
+Status SyncSourceFeedback::_updateUpstream(OperationContext* txn,
+                                           BackgroundSync* bgsync,
+                                           Reporter* reporter) {
     auto syncTarget = reporter->getTarget();
 
     auto triggerStatus = reporter->trigger();
@@ -135,7 +139,11 @@ Status SyncSourceFeedback::_updateUpstream(OperationContext* txn, BackgroundSync
             // Blacklist sync target for .5 seconds and find a new one.
             stdx::lock_guard<stdx::mutex> lock(_mtx);
             auto replCoord = repl::ReplicationCoordinator::get(txn);
-            replCoord->blacklistSyncSource(syncTarget, Date_t::now() + Milliseconds(500));
+            const auto blacklistDuration = Milliseconds{500};
+            const auto until = Date_t::now() + blacklistDuration;
+            log() << "Blacklisting " << syncTarget << " due to error: '" << status << "' for "
+                  << blacklistDuration << " until: " << until;
+            replCoord->blacklistSyncSource(syncTarget, until);
             bgsync->clearSyncTarget();
         }
     }
@@ -227,6 +235,9 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
             keepAliveInterval);
         {
             stdx::lock_guard<stdx::mutex> lock(_mtx);
+            if (_shutdownSignaled) {
+                break;
+            }
             _reporter = &reporter;
         }
         ON_BLOCK_EXIT([this]() {
@@ -234,7 +245,7 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
             _reporter = nullptr;
         });
 
-        auto status = _updateUpstream(txn.get(), bgsync);
+        auto status = _updateUpstream(txn.get(), bgsync, &reporter);
         if (!status.isOK()) {
             LOG(1) << "The replication progress command (replSetUpdatePosition) failed and will be "
                       "retried: "

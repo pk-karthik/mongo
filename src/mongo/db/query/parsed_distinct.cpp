@@ -35,12 +35,67 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
 const char ParsedDistinct::kKeyField[] = "key";
 const char ParsedDistinct::kQueryField[] = "query";
 const char ParsedDistinct::kCollationField[] = "collation";
+
+StatusWith<BSONObj> ParsedDistinct::asAggregationCommand() const {
+    BSONObjBuilder aggregationBuilder;
+
+    invariant(_query);
+    const QueryRequest& qr = _query->getQueryRequest();
+    aggregationBuilder.append("aggregate", qr.nss().coll());
+
+    // Build a pipeline that accomplishes the distinct request. The building code constructs a
+    // pipeline that looks like this:
+    //
+    //      [
+    //          { $match: { ... } },
+    //          { $unwind: { path: "$<key>", preserveNullAndEmptyArrays: true } },
+    //          { $group: { _id: null, distinct: { $addToSet: "$<key>" } } }
+    //      ]
+    BSONArrayBuilder pipelineBuilder(aggregationBuilder.subarrayStart("pipeline"));
+    if (!qr.getFilter().isEmpty()) {
+        BSONObjBuilder matchStageBuilder(pipelineBuilder.subobjStart());
+        matchStageBuilder.append("$match", qr.getFilter());
+        matchStageBuilder.doneFast();
+    }
+    BSONObjBuilder unwindStageBuilder(pipelineBuilder.subobjStart());
+    {
+        BSONObjBuilder unwindBuilder(unwindStageBuilder.subobjStart("$unwind"));
+        unwindBuilder.append("path", str::stream() << "$" << _key);
+        unwindBuilder.append("preserveNullAndEmptyArrays", true);
+        unwindBuilder.doneFast();
+    }
+    unwindStageBuilder.doneFast();
+    BSONObjBuilder groupStageBuilder(pipelineBuilder.subobjStart());
+    {
+        BSONObjBuilder groupBuilder(groupStageBuilder.subobjStart("$group"));
+        groupBuilder.appendNull("_id");
+        {
+            BSONObjBuilder distinctBuilder(groupBuilder.subobjStart("distinct"));
+            distinctBuilder.append("$addToSet", str::stream() << "$" << _key);
+            distinctBuilder.doneFast();
+        }
+        groupBuilder.doneFast();
+    }
+    groupStageBuilder.doneFast();
+    pipelineBuilder.doneFast();
+
+    if (_query->getQueryRequest().isExplain()) {
+        aggregationBuilder.append("explain", true);
+    }
+    aggregationBuilder.append(kCollationField, qr.getCollation());
+
+    // Specify the 'cursor' option so that aggregation uses the cursor interface.
+    aggregationBuilder.append("cursor", BSONObj());
+
+    return aggregationBuilder.obj();
+}
 
 StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* txn,
                                                  const NamespaceString& nss,

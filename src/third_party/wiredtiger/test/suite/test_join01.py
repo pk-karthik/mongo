@@ -27,7 +27,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import wiredtiger, wttest
-from wtscenario import check_scenarios, multiply_scenarios, number_scenarios
+from wtscenario import make_scenarios
 
 # test_join01.py
 #    Join operations
@@ -67,11 +67,9 @@ class test_join01(wttest.WiredTigerTestCase):
         ('order=2', dict(join_order=2)),
         ('order=3', dict(join_order=3)),
     ]
-    scenarios = number_scenarios(multiply_scenarios('.', type_scen,
-                                                    bloom0_scen, bloom1_scen,
-                                                    projection_scen,
-                                                    nested_scen, stats_scen,
-                                                    order_scen))
+    scenarios = make_scenarios(type_scen, bloom0_scen, bloom1_scen,
+                               projection_scen, nested_scen, stats_scen,
+                               order_scen, prune=50, prunelong=1000)
 
     # We need statistics for these tests.
     conn_config = 'statistics=(all)'
@@ -112,8 +110,9 @@ class test_join01(wttest.WiredTigerTestCase):
         while jc.next() == 0:
             [k] = jc.get_keys()
             i = k - 1
-            if do_proj:  # our projection test simply reverses the values
-                [v2,v1,v0] = jc.get_values()
+            if do_proj:  # our projection reverses the values and adds the key
+                [v2,v1,v0,kproj] = jc.get_values()
+                self.assertEquals(k, kproj)
             else:
                 [v0,v1,v2] = jc.get_values()
             self.assertEquals(self.gen_values(i), [v0,v1,v2])
@@ -138,7 +137,7 @@ class test_join01(wttest.WiredTigerTestCase):
         if self.ref == 'index':
             expectstats.append('join: index:join01:index0: ' + statdesc)
         elif self.do_proj:
-            expectstats.append('join: table:join01(v2,v1,v0): ' + statdesc)
+            expectstats.append('join: table:join01(v2,v1,v0,k): ' + statdesc)
         else:
             expectstats.append('join: table:join01: ' + statdesc)
         self.check_stats(statcur, expectstats)
@@ -230,7 +229,7 @@ class test_join01(wttest.WiredTigerTestCase):
         c.close()
 
         if do_proj:
-            proj_suffix = '(v2,v1,v0)'  # Reversed values
+            proj_suffix = '(v2,v1,v0,k)'  # Reversed values plus key
         else:
             proj_suffix = ''            # Default projection (v0,v1,v2)
 

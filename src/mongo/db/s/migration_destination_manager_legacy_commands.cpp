@@ -91,62 +91,25 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        ShardingState* const shardingState = ShardingState::get(txn);
+        auto shardingState = ShardingState::get(txn);
+        uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-        // Active state of TO-side migrations (MigrateStatus) is serialized by distributed
-        // collection lock.
-        if (shardingState->migrationDestinationManager()->isActive()) {
-            errmsg = "migrate already in progress";
-            return false;
-        }
+        const ShardId toShard(cmdObj["toShardName"].String());
+        const ShardId fromShard(cmdObj["fromShardName"].String());
 
-        // Pending deletes (for migrations) are serialized by the distributed collection lock,
-        // we are sure we registered a delete for a range *before* we can migrate-in a
-        // subrange.
-        const size_t numDeletes = getDeleter()->getTotalDeletes();
-        if (numDeletes > 0) {
-            errmsg = str::stream() << "can't accept new chunks because "
-                                   << " there are still " << numDeletes
-                                   << " deletes from previous migration";
+        const NamespaceString nss(cmdObj.firstElement().String());
 
-            warning() << errmsg;
-            return false;
-        }
-
-        if (!shardingState->enabled()) {
-            if (!cmdObj["configServer"].eoo()) {
-                dassert(cmdObj["configServer"].type() == String);
-                shardingState->initializeFromConfigConnString(txn, cmdObj["configServer"].String());
-            } else {
-                errmsg = str::stream()
-                    << "cannot start recv'ing chunk, "
-                    << "sharding is not enabled and no config server was provided";
-
-                warning() << errmsg;
-                return false;
-            }
-        }
-
-        if (!cmdObj["toShardName"].eoo()) {
-            dassert(cmdObj["toShardName"].type() == String);
-            shardingState->setShardName(cmdObj["toShardName"].String());
-        }
-
-        const string ns = cmdObj.firstElement().String();
-
-        BSONObj min = cmdObj["min"].Obj().getOwned();
-        BSONObj max = cmdObj["max"].Obj().getOwned();
+        const auto chunkRange = uassertStatusOK(ChunkRange::fromBSON(cmdObj));
 
         // Refresh our collection manager from the config server, we need a collection manager to
         // start registering pending chunks. We force the remote refresh here to make the behavior
         // consistent and predictable, generally we'd refresh anyway, and to be paranoid.
         ChunkVersion currentVersion;
 
-        Status status = shardingState->refreshMetadataNow(txn, ns, &currentVersion);
+        Status status = shardingState->refreshMetadataNow(txn, nss, &currentVersion);
         if (!status.isOK()) {
-            errmsg = str::stream() << "cannot start recv'ing chunk "
-                                   << "[" << min << "," << max << ")" << causedBy(status.reason());
-
+            errmsg = str::stream() << "cannot start receiving chunk "
+                                   << redact(chunkRange.toString()) << causedBy(redact(status));
             warning() << errmsg;
             return false;
         }
@@ -159,23 +122,48 @@ public:
 
         BSONObj shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
 
-        const string fromShard(cmdObj["from"].String());
+        auto statusWithFromShardConnectionString = ConnectionString::parse(cmdObj["from"].String());
+        if (!statusWithFromShardConnectionString.isOK()) {
+            errmsg = str::stream()
+                << "cannot start receiving chunk " << redact(chunkRange.toString())
+                << causedBy(redact(statusWithFromShardConnectionString.getStatus()));
+
+            warning() << errmsg;
+            return false;
+        }
 
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
-        Status startStatus =
-            shardingState->migrationDestinationManager()->start(ns,
-                                                                migrationSessionId,
-                                                                fromShard,
-                                                                min,
-                                                                max,
-                                                                shardKeyPattern,
-                                                                currentVersion.epoch(),
-                                                                writeConcern);
-        if (!startStatus.isOK()) {
-            return appendCommandStatus(result, startStatus);
+        // Ensure this shard is not currently receiving or donating any chunks.
+        auto scopedRegisterReceiveChunk(
+            uassertStatusOK(shardingState->registerReceiveChunk(nss, chunkRange, fromShard)));
+
+        // Even if this shard is not currently donating any chunks, it may still have pending
+        // deletes from a previous migration, particularly if there are still open cursors on the
+        // range pending deletion.
+        const size_t numDeletes = getDeleter()->getTotalDeletes();
+        if (numDeletes > 0) {
+            errmsg = str::stream() << "can't accept new chunks because "
+                                   << " there are still " << numDeletes
+                                   << " deletes from previous migration";
+
+            warning() << errmsg;
+            return appendCommandStatus(result, {ErrorCodes::ChunkRangeCleanupPending, errmsg});
         }
+
+        uassertStatusOK(shardingState->migrationDestinationManager()->start(
+            nss,
+            std::move(scopedRegisterReceiveChunk),
+            migrationSessionId,
+            statusWithFromShardConnectionString.getValue(),
+            fromShard,
+            toShard,
+            chunkRange.getMin(),
+            chunkRange.getMax(),
+            shardKeyPattern,
+            currentVersion.epoch(),
+            writeConcern));
 
         result.appendBool("started", true);
         return true;
@@ -258,13 +246,15 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const MigrationSessionId migrationSessionid(
-            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-        const bool ok =
-            ShardingState::get(txn)->migrationDestinationManager()->startCommit(migrationSessionid);
-
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
-        return ok;
+        auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
+        auto mdm = ShardingState::get(txn)->migrationDestinationManager();
+        Status const status = mdm->startCommit(sessionId);
+        mdm->report(result);
+        if (!status.isOK()) {
+            log() << status.reason();
+            return appendCommandStatus(result, status);
+        }
+        return true;
     }
 
 } recvChunkCommitCommand;
@@ -304,8 +294,22 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        ShardingState::get(txn)->migrationDestinationManager()->abort();
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
+        auto const mdm = ShardingState::get(txn)->migrationDestinationManager();
+
+        auto migrationSessionIdStatus(MigrationSessionId::extractFromBSON(cmdObj));
+
+        if (migrationSessionIdStatus.isOK()) {
+            Status const status = mdm->abort(migrationSessionIdStatus.getValue());
+            mdm->report(result);
+            if (!status.isOK()) {
+                log() << status.reason();
+                return appendCommandStatus(result, status);
+            }
+        } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {
+            mdm->abortWithoutSessionIdCheck();
+            mdm->report(result);
+        }
+        uassertStatusOK(migrationSessionIdStatus.getStatus());
         return true;
     }
 

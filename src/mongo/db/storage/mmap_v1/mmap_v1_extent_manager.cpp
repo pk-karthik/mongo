@@ -70,7 +70,8 @@ MONGO_FP_DECLARE(recordNeedsFetchFail);
 
 // Used to make sure the compiler doesn't get too smart on us when we're
 // trying to touch records.
-volatile int __record_touch_dummy = 1;
+// volatile - avoid compiler optimizations for touching a mmap page
+volatile int __record_touch_dummy = 1;  // NOLINT
 
 class MmapV1RecordFetcher : public RecordFetcher {
     MONGO_DISALLOW_COPYING(MmapV1RecordFetcher);
@@ -608,19 +609,6 @@ void MmapV1ExtentManager::freeListStats(OperationContext* txn,
     }
 }
 
-void MmapV1ExtentManager::printFreeList() const {
-    log() << "dump freelist " << _dbname << endl;
-
-    DiskLoc a = _getFreeListStart();
-    while (!a.isNull()) {
-        Extent* e = getExtent(a);
-        log() << "  extent " << a.toString() << " len:" << e->length
-              << " prev:" << e->xprev.toString() << endl;
-        a = e->xnext;
-    }
-
-    log() << "end freelist" << endl;
-}
 
 namespace {
 class CacheHintMadvise : public ExtentManager::CacheHint {

@@ -21,6 +21,10 @@ class ReplicaSetFixture(interface.ReplFixture):
     Fixture which provides JSTests with a replica set to run against.
     """
 
+    # Error response codes copied from mongo/base/error_codes.err.
+    _ALREADY_INITIALIZED = 23
+    _NODE_NOT_FOUND = 74
+
     def __init__(self,
                  logger,
                  job_num,
@@ -29,9 +33,11 @@ class ReplicaSetFixture(interface.ReplFixture):
                  dbpath_prefix=None,
                  preserve_dbpath=False,
                  num_nodes=2,
+                 start_initial_sync_node=False,
                  write_concern_majority_journal_default=None,
                  auth_options=None,
-                 replset_config_options=None):
+                 replset_config_options=None,
+                 voting_secondaries=True):
 
         interface.ReplFixture.__init__(self, logger, job_num)
 
@@ -39,9 +45,11 @@ class ReplicaSetFixture(interface.ReplFixture):
         self.mongod_options = utils.default_if_none(mongod_options, {})
         self.preserve_dbpath = preserve_dbpath
         self.num_nodes = num_nodes
+        self.start_initial_sync_node = start_initial_sync_node
         self.write_concern_majority_journal_default = write_concern_majority_journal_default
         self.auth_options = auth_options
         self.replset_config_options = utils.default_if_none(replset_config_options, {})
+        self.voting_secondaries = voting_secondaries
 
         # The dbpath in mongod_options is used as the dbpath prefix for replica set members and
         # takes precedence over other settings. The ShardedClusterFixture uses this parameter to
@@ -58,6 +66,8 @@ class ReplicaSetFixture(interface.ReplFixture):
 
         self.nodes = []
         self.replset_name = None
+        self.initial_sync_node = None
+        self.initial_sync_node_idx = -1
 
     def setup(self):
         self.replset_name = self.mongod_options.get("replSet", "rs")
@@ -69,6 +79,14 @@ class ReplicaSetFixture(interface.ReplFixture):
 
         for node in self.nodes:
             node.setup()
+
+        if self.start_initial_sync_node:
+            if not self.initial_sync_node:
+                self.initial_sync_node_idx = len(self.nodes)
+                self.initial_sync_node = self._new_mongod(self.initial_sync_node_idx,
+                                                          self.replset_name)
+            self.initial_sync_node.setup()
+            self.initial_sync_node.await_ready()
 
         self.port = self.get_primary().port
 
@@ -83,14 +101,19 @@ class ReplicaSetFixture(interface.ReplFixture):
             member_info = {"_id": i, "host": node.get_connection_string()}
             if i > 0:
                 member_info["priority"] = 0
-            if i >= 7:
-                # Only 7 nodes in a replica set can vote, so the other members must be non-voting.
-                member_info["votes"] = 0
+                if i >= 7 or not self.voting_secondaries:
+                    # Only 7 nodes in a replica set can vote, so the other members must still be
+                    # non-voting when this fixture is configured to have voting secondaries.
+                    member_info["votes"] = 0
             members.append(member_info)
-        initiate_cmd_obj = {"replSetInitiate": {"_id": self.replset_name, "members": members}}
+        if self.initial_sync_node:
+            members.append({"_id": self.initial_sync_node_idx,
+                            "host": self.initial_sync_node.get_connection_string(),
+                            "priority": 0,
+                            "hidden": 1,
+                            "votes": 0})
 
-        if self.write_concern_majority_journal_default is not None:
-            initiate_cmd_obj["replSetInitiate"]["writeConcernMajorityJournalDefault"] = self.write_concern_majority_journal_default
+        initiate_cmd_obj = {"replSetInitiate": {"_id": self.replset_name, "members": members}}
 
         client = utils.new_mongo_client(port=self.port)
         if self.auth_options is not None:
@@ -99,11 +122,47 @@ class ReplicaSetFixture(interface.ReplFixture):
                                  password=self.auth_options["password"],
                                  mechanism=self.auth_options["authenticationMechanism"])
 
+        if self.write_concern_majority_journal_default is not None:
+            initiate_cmd_obj["replSetInitiate"]["writeConcernMajorityJournalDefault"] = self.write_concern_majority_journal_default
+        else:
+            serverStatus = client.admin.command({"serverStatus": 1})
+            cmdLineOpts = client.admin.command({"getCmdLineOpts": 1})
+            if not (serverStatus["storageEngine"]["persistent"] and
+                    cmdLineOpts["parsed"].get("storage", {}).get("journal", {}).get("enabled", True)):
+                initiate_cmd_obj["replSetInitiate"]["writeConcernMajorityJournalDefault"] = False
+
         if self.replset_config_options.get("configsvr", False):
             initiate_cmd_obj["replSetInitiate"]["configsvr"] = True
+        if self.replset_config_options.get("settings"):
+            replset_settings = self.replset_config_options["settings"]
+            initiate_cmd_obj["replSetInitiate"]["settings"] = replset_settings
 
         self.logger.info("Issuing replSetInitiate command...%s", initiate_cmd_obj)
-        client.admin.command(initiate_cmd_obj)
+
+        # replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error
+        # if a heartbeat times out during the quorum check. We retry three times to reduce
+        # the chance of failing this way.
+        num_initiate_attempts = 3
+        for attempt in range(1, num_initiate_attempts + 1):
+            try:
+                client.admin.command(initiate_cmd_obj)
+                break
+            except pymongo.errors.OperationFailure as err:
+                # Ignore errors from the "replSetInitiate" command when the replica set has already
+                # been initiated.
+                if err.code == ReplicaSetFixture._ALREADY_INITIALIZED:
+                    return
+
+                # Retry on NodeNotFound errors from the "replSetInitiate" command.
+                if err.code != ReplicaSetFixture._NODE_NOT_FOUND:
+                    raise
+
+                msg = "replSetInitiate failed attempt {0} of {1} with error: {2}".format(
+                    attempt, num_initiate_attempts, err)
+                self.logger.error(msg)
+                if attempt == num_initiate_attempts:
+                    raise
+                time.sleep(5)  # Wait a little bit before trying again.
 
     def await_ready(self):
         # Wait for the primary to be elected.
@@ -115,8 +174,12 @@ class ReplicaSetFixture(interface.ReplFixture):
             self.logger.info("Waiting for primary on port %d to be elected.", self.port)
             time.sleep(0.1)  # Wait a little bit before trying again.
 
+        secondaries = self.get_secondaries()
+        if self.initial_sync_node:
+            secondaries.append(self.initial_sync_node)
+
         # Wait for the secondaries to become available.
-        for secondary in self.get_secondaries():
+        for secondary in secondaries:
             client = utils.new_mongo_client(port=secondary.port,
                                             read_preference=pymongo.ReadPreference.SECONDARY)
             while True:
@@ -136,6 +199,9 @@ class ReplicaSetFixture(interface.ReplFixture):
         else:
             self.logger.info("Stopping all members of the replica set...")
 
+        if self.initial_sync_node:
+            success = self.initial_sync_node.teardown() and success
+
         # Terminate the secondaries first to reduce noise in the logs.
         for node in reversed(self.nodes):
             success = node.teardown() and success
@@ -146,7 +212,12 @@ class ReplicaSetFixture(interface.ReplFixture):
         return success
 
     def is_running(self):
-        return all(node.is_running() for node in self.nodes)
+        running = all(node.is_running() for node in self.nodes)
+
+        if self.initial_sync_node:
+            running = self.initial_sync_node.is_running() or running
+
+        return running
 
     def get_primary(self):
         # The primary is always the first element of the 'nodes' list because all other members of
@@ -156,32 +227,8 @@ class ReplicaSetFixture(interface.ReplFixture):
     def get_secondaries(self):
         return self.nodes[1:]
 
-    def await_repl(self):
-        client = utils.new_mongo_client(port=self.port)
-
-        self.logger.info("Starting fsync on primary on port %d to flush all pending writes",
-                         self.port)
-        client.fsync()
-        self.logger.info("fsync on primary completed")
-
-        self.logger.info("Awaiting replication of insert (w=%d, wtimeout=%d min) to primary on port"
-                         " %d", self.num_nodes, interface.ReplFixture.AWAIT_REPL_TIMEOUT_MINS,
-                         self.port)
-
-        # Keep retrying this until it times out waiting for replication.
-        def insert_fn(remaining_secs):
-            remaining_millis = int(round(remaining_secs * 1000))
-            write_concern = pymongo.WriteConcern(w=self.num_nodes, wtimeout=remaining_millis)
-            coll = client.resmoke.get_collection("await_repl", write_concern=write_concern)
-            coll.insert_one({"awaiting": "repl"})
-
-        try:
-            self.retry_until_wtimeout(insert_fn)
-        except pymongo.errors.WTimeoutError:
-            self.logger.info("Replication of write operation timed out.")
-            raise
-
-        self.logger.info("Replication of write operation completed.")
+    def get_initial_sync_node(self):
+        return self.initial_sync_node
 
     def _new_mongod(self, index, replset_name):
         """
@@ -202,12 +249,14 @@ class ReplicaSetFixture(interface.ReplFixture):
 
     def _get_logger_for_mongod(self, index):
         """
-        Returns a new logging.Logger instance for use as the primary or
-        secondary of a replica-set.
+        Returns a new logging.Logger instance for use as the primary, secondary, or initial
+        sync member of a replica-set.
         """
 
         if index == 0:
             logger_name = "%s:primary" % (self.logger.name)
+        elif index == self.initial_sync_node_idx:
+            logger_name = "%s:initsync" % (self.logger.name)
         else:
             suffix = str(index - 1) if self.num_nodes > 2 else ""
             logger_name = "%s:secondary%s" % (self.logger.name, suffix)
@@ -219,4 +268,6 @@ class ReplicaSetFixture(interface.ReplFixture):
             raise ValueError("Must call setup() before calling get_connection_string()")
 
         conn_strs = [node.get_connection_string() for node in self.nodes]
+        if self.initial_sync_node:
+            conn_strs.append(self.initial_sync_node.get_connection_string())
         return self.replset_name + "/" + ",".join(conn_strs)

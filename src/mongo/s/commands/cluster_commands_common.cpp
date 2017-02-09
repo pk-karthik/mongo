@@ -35,10 +35,12 @@
 #include "mongo/client/parallel.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/version_manager.h"
-#include "mongo/s/query/cluster_client_cursor_impl.h"
-#include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
@@ -46,6 +48,26 @@ namespace mongo {
 
 using std::shared_ptr;
 using std::string;
+
+namespace {
+
+bool forceRemoteCheckShardVersionCB(OperationContext* txn, const string& ns) {
+    const NamespaceString nss(ns);
+
+    // This will force the database catalog entry to be reloaded
+    Grid::get(txn)->catalogCache()->invalidate(nss.db());
+
+    auto scopedCMStatus = ScopedChunkManager::get(txn, nss);
+    if (!scopedCMStatus.isOK()) {
+        return false;
+    }
+
+    const auto& scopedCM = scopedCMStatus.getValue();
+
+    return scopedCM.cm() != nullptr;
+}
+
+}  // namespace
 
 Future::CommandResult::CommandResult(const string& server,
                                      const string& db,
@@ -85,7 +107,7 @@ void Future::CommandResult::init() {
             _ok = _conn->runCommand(_db, _cmd, _res, _options);
         }
     } catch (std::exception& e) {
-        error() << "Future::spawnCommand (part 1) exception: " << e.what();
+        error() << "Future::spawnCommand (part 1) exception: " << redact(e.what());
         _ok = false;
         _done = true;
     }
@@ -127,13 +149,15 @@ bool Future::CommandResult::join(OperationContext* txn, int maxRetries) {
                 staleNS = _db;
 
             if (i >= maxRetries) {
-                error() << "Future::spawnCommand (part 2) stale config exception" << causedBy(e);
+                error() << "Future::spawnCommand (part 2) stale config exception"
+                        << causedBy(redact(e));
                 throw e;
             }
 
             if (i >= maxRetries / 2) {
-                if (!versionManager.forceRemoteCheckShardVersionCB(txn, staleNS)) {
-                    error() << "Future::spawnCommand (part 2) no config detected" << causedBy(e);
+                if (!forceRemoteCheckShardVersionCB(txn, staleNS)) {
+                    error() << "Future::spawnCommand (part 2) no config detected"
+                            << causedBy(redact(e));
                     throw e;
                 }
             }
@@ -142,19 +166,20 @@ bool Future::CommandResult::join(OperationContext* txn, int maxRetries) {
             // collection is supposed to be acted on, if any
             if (nsGetCollection(staleNS).size() == 0) {
                 warning() << "no collection namespace in stale config exception "
-                          << "for lazy command " << _cmd << ", could not refresh " << staleNS;
+                          << "for lazy command " << redact(_cmd) << ", could not refresh "
+                          << staleNS;
             } else {
                 versionManager.checkShardVersionCB(txn, _conn, staleNS, false, 1);
             }
 
-            LOG(i > 1 ? 0 : 1) << "retrying lazy command" << causedBy(e);
+            LOG(i > 1 ? 0 : 1) << "retrying lazy command" << causedBy(redact(e));
 
             verify(_conn->lazySupported());
             _done = false;
             init();
             continue;
         } catch (std::exception& e) {
-            error() << "Future::spawnCommand (part 2) exception: " << causedBy(e);
+            error() << "Future::spawnCommand (part 2) exception: " << causedBy(redact(e.what()));
             break;
         }
     }
@@ -215,6 +240,25 @@ bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::stri
     }
 
     return Command::appendCommandStatus(result, status);
+}
+
+std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* txn,
+                                                           StringData dbName) {
+    const auto dbNameStr = dbName.toString();
+
+    std::vector<CollectionType> collectionsOnConfig;
+    uassertStatusOK(Grid::get(txn)->catalogClient(txn)->getCollections(
+        txn, &dbNameStr, &collectionsOnConfig, nullptr));
+
+    std::vector<NamespaceString> collectionsToReturn;
+    for (const auto& coll : collectionsOnConfig) {
+        if (coll.getDropped())
+            continue;
+
+        collectionsToReturn.push_back(coll.getNs());
+    }
+
+    return collectionsToReturn;
 }
 
 }  // namespace mongo

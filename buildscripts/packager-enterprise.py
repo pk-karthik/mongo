@@ -42,7 +42,7 @@ import time
 import urlparse
 
 # The MongoDB names for the architectures we support.
-ARCH_CHOICES=["x86_64", "ppc64le", "s390x"]
+ARCH_CHOICES=["x86_64", "ppc64le", "s390x", "arm64"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS=["suse", "debian","redhat","ubuntu","amazon"]
@@ -111,7 +111,7 @@ class EnterpriseDistro(packager.Distro):
         """
         if arch == "ppc64le":
             if self.n == 'ubuntu':
-                return [ "ubuntu1504" ]
+                return [ "ubuntu1604" ]
             if self.n == 'redhat':
                 return [ "rhel71" ]
             else:
@@ -119,6 +119,15 @@ class EnterpriseDistro(packager.Distro):
         if arch == "s390x":
             if self.n == 'redhat':
                 return [ "rhel72" ]
+            if self.n == 'suse':
+                return [ "suse11", "suse12" ]
+            if self.n == 'ubuntu':
+                return [ "ubuntu1604" ]
+            else:
+                return []
+        if arch == "arm64":
+            if self.n == 'ubuntu':
+                return [ "ubuntu1604" ]
             else:
                 return []
 
@@ -148,10 +157,7 @@ def main(argv):
 
     os.chdir(prefix)
     try:
-      # Download the binaries.
-      urlfmt="http://downloads.mongodb.com/linux/mongodb-linux-%s-enterprise-%s-%s.tgz"
       made_pkg = False
-
       # Build a package for each distro/spec/arch tuple, and
       # accumulate the repository-layout directories.
       for (distro, arch) in packager.crossproduct(distros, args.arches):
@@ -159,12 +165,9 @@ def main(argv):
           for build_os in distro.build_os(arch):
             if build_os in args.distros or not args.distros:
 
-              if args.tarball:
-                filename = tarfile(build_os, arch, spec)
-                packager.ensure_dir(filename)
-                shutil.copyfile(args.tarball,filename)
-              else:
-                packager.httpget(urlfmt % (arch, build_os, spec.version()), packager.ensure_dir(tarfile(build_os, arch, spec)))
+              filename = tarfile(build_os, arch, spec)
+              packager.ensure_dir(filename)
+              shutil.copyfile(args.tarball, filename)
 
               repo = make_package(distro, build_os, arch, spec, srcdir)
               make_repo(repo, distro, build_os, spec)
@@ -230,11 +233,10 @@ def make_package(distro, build_os, arch, spec, srcdir):
     # packaging infrastructure will move the files to wherever they
     # need to go.
     unpack_binaries_into(build_os, arch, spec, sdir)
-    # Remove the mongosniff binary due to libpcap dynamic
-    # linkage.  FIXME: this removal should go away
-    # eventually.
-    if os.path.exists(sdir + "bin/mongosniff"):
-      os.unlink(sdir + "bin/mongosniff")
+    # Remove the mongoreplay binary due to libpcap dynamic
+    # linkage.
+    if os.path.exists(sdir + "bin/mongoreplay"):
+      os.unlink(sdir + "bin/mongoreplay")
     return distro.make_pkg(build_os, arch, spec, srcdir)
 
 def make_repo(repodir, distro, build_os, spec):
@@ -268,7 +270,7 @@ def make_deb_repo(repo, distro, build_os, spec):
 Label: mongodb
 Suite: %s
 Codename: %s/mongodb-enterprise
-Architectures: amd64 ppc64el s390x
+Architectures: amd64 ppc64el s390x arm64
 Components: %s
 Description: MongoDB packages
 """ % (distro.repo_os_version(build_os), distro.repo_os_version(build_os), distro.repo_component())

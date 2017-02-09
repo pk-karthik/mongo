@@ -32,10 +32,10 @@
 
 #include "mongo/db/commands/index_filter_commands.h"
 
-
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
@@ -347,9 +347,9 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
         planCache, "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}", "{locale: 'mock_reverse_string'}"));
 
     // Fields in filter should match criteria in most recent query settings update.
-    ASSERT_EQUALS(filters[0].getObjectField("query"), fromjson("{a: 1, b: 1}"));
-    ASSERT_EQUALS(filters[0].getObjectField("sort"), fromjson("{a: -1}"));
-    ASSERT_EQUALS(filters[0].getObjectField("projection"), fromjson("{_id: 0, a: 1}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("query"), fromjson("{a: 1, b: 1}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("sort"), fromjson("{a: -1}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("projection"), fromjson("{_id: 0, a: 1}"));
     ASSERT_EQUALS(StringData(filters[0].getObjectField("collation").getStringField("locale")),
                   "mock_reverse_string");
 
@@ -364,6 +364,11 @@ TEST(IndexFilterCommandsTest, SetAndClearFilters) {
                                       "indexes: [{a: 1, b: 1}]}")));
     filters = getFilters(querySettings);
     ASSERT_EQUALS(filters.size(), 1U);
+    auto filterIndexes = filters[0]["indexes"];
+    ASSERT(filterIndexes.type() == BSONType::Array);
+    auto filterArray = filterIndexes.Array();
+    ASSERT_EQ(filterArray.size(), 1U);
+    ASSERT_BSONOBJ_EQ(filterArray[0].Obj(), fromjson("{a: 1, b: 1}"));
 
     // Add hint for different query shape.
     ASSERT_OK(SetFilter::set(txn.get(),
@@ -433,9 +438,9 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
                                       "indexes: [{a: 1}]}")));
     vector<BSONObj> filters = getFilters(querySettings);
     ASSERT_EQUALS(filters.size(), 1U);
-    ASSERT_EQUALS(filters[0].getObjectField("query"), fromjson("{a: 'foo'}"));
-    ASSERT_EQUALS(filters[0].getObjectField("sort"), fromjson("{}"));
-    ASSERT_EQUALS(filters[0].getObjectField("projection"), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("query"), fromjson("{a: 'foo'}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("sort"), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("projection"), fromjson("{}"));
     ASSERT_EQUALS(StringData(filters[0].getObjectField("collation").getStringField("locale")),
                   "mock_reverse_string");
 
@@ -467,15 +472,47 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
         fromjson("{query: {a: 'foo'}, collation: {locale: 'mock_reverse_string'}}")));
     filters = getFilters(querySettings);
     ASSERT_EQUALS(filters.size(), 1U);
-    ASSERT_EQUALS(filters[0].getObjectField("query"), fromjson("{a: 'foo'}"));
-    ASSERT_EQUALS(filters[0].getObjectField("sort"), fromjson("{}"));
-    ASSERT_EQUALS(filters[0].getObjectField("projection"), fromjson("{}"));
-    ASSERT_EQUALS(filters[0].getObjectField("collation"), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("query"), fromjson("{a: 'foo'}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("sort"), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("projection"), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(filters[0].getObjectField("collation"), fromjson("{}"));
 
     // Plan cache should only contain entry for query without collation.
     ASSERT_FALSE(
         planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
     ASSERT_TRUE(planCacheContains(planCache, "{a: 'foo'}", "{}", "{}", "{}"));
+}
+
+
+TEST(IndexFilterCommandsTest, SetFilterAcceptsIndexNames) {
+    CollatorInterfaceMock reverseCollator(CollatorInterfaceMock::MockType::kReverseString);
+    IndexEntry collatedIndex(
+        fromjson("{a: 1}"), false, false, false, "a_1:rev", nullptr, BSONObj());
+    collatedIndex.collator = &reverseCollator;
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+    QuerySettings querySettings;
+
+    PlanCache planCache;
+    planCache.notifyOfIndexEntries(
+        {IndexEntry(fromjson("{a: 1}"), false, false, false, "a_1", nullptr, BSONObj()),
+         collatedIndex});
+
+    addQueryShapeToPlanCache(txn.get(), &planCache, "{a: 2}", "{}", "{}", "{}");
+    ASSERT_TRUE(planCacheContains(planCache, "{a: 2}", "{}", "{}", "{}"));
+
+    ASSERT_OK(SetFilter::set(txn.get(),
+                             &querySettings,
+                             &planCache,
+                             nss.ns(),
+                             fromjson("{query: {a: 2}, sort: {}, projection: {},"
+                                      "indexes: [{a: 1}, 'a_1:rev']}")));
+    auto filters = getFilters(querySettings);
+    ASSERT_EQUALS(filters.size(), 1U);
+    auto indexes = filters[0]["indexes"].Array();
+
+    ASSERT_BSONOBJ_EQ(indexes[0].embeddedObject(), fromjson("{a: 1}"));
+    ASSERT_EQUALS(indexes[1].valueStringData(), "a_1:rev");
 }
 
 }  // namespace

@@ -14,7 +14,7 @@ var nodes = {
     n3: {binVersion: newVersion}
 };
 
-var rst = new ReplSetTest({name: name, nodes: nodes, nodeOptions: {storageEngine: 'mmapv1'}});
+var rst = new ReplSetTest({name: name, nodes: nodes});
 rst.startSet();
 var replSetConfig = rst.getReplSetConfig();
 replSetConfig.protocolVersion = 0;

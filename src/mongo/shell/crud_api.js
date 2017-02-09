@@ -27,12 +27,17 @@ DBCollection.prototype._createWriteConcern = function(options) {
  *     Otherwise, returns the same object passed.
  */
 DBCollection.prototype.addIdIfNeeded = function(obj) {
+    if (typeof obj !== "object") {
+        throw new Error('argument passed to addIdIfNeeded is not an object');
+    }
     if (typeof(obj._id) == "undefined" && !Array.isArray(obj)) {
         var tmp = obj;  // don't want to modify input
         obj = {_id: new ObjectId()};
 
         for (var key in tmp) {
-            obj[key] = tmp[key];
+            if (tmp.hasOwnProperty(key)) {
+                obj[key] = tmp[key];
+            }
         }
     }
 
@@ -232,20 +237,8 @@ DBCollection.prototype.insertOne = function(document, options) {
     var bulk = this.initializeOrderedBulkOp();
     bulk.insert(document);
 
-    try {
-        // Execute insert
-        bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    // Execute insert
+    bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;
@@ -341,20 +334,7 @@ DBCollection.prototype.deleteOne = function(filter, options) {
     // Add the deleteOne operation.
     removeOp.removeOne();
 
-    try {
-        // Remove the first document that matches the selector
-        var r = bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    var r = bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;
@@ -396,20 +376,7 @@ DBCollection.prototype.deleteMany = function(filter, options) {
     // Add the deleteOne operation.
     removeOp.remove();
 
-    try {
-        // Remove all documents that matche the selector
-        var r = bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    var r = bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;
@@ -463,20 +430,7 @@ DBCollection.prototype.replaceOne = function(filter, replacement, options) {
 
     op.replaceOne(replacement);
 
-    try {
-        // Replace the document
-        var r = bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    var r = bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;
@@ -540,20 +494,7 @@ DBCollection.prototype.updateOne = function(filter, update, options) {
 
     op.updateOne(update);
 
-    try {
-        // Update the first document that matches the selector
-        var r = bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    var r = bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;
@@ -617,20 +558,7 @@ DBCollection.prototype.updateMany = function(filter, update, options) {
 
     op.update(update);
 
-    try {
-        // Update all documents that match the selector
-        var r = bulk.execute(writeConcern);
-    } catch (err) {
-        if (err.hasWriteErrors()) {
-            throw err.getWriteErrorAt(0);
-        }
-
-        if (err.hasWriteConcernError()) {
-            throw err.getWriteConcernError();
-        }
-
-        throw err;
-    }
+    var r = bulk.execute(writeConcern);
 
     if (!result.acknowledged) {
         return result;

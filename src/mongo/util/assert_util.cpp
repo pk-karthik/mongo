@@ -74,7 +74,7 @@ void AssertionCount::condrollover(int newvalue) {
         rollover();
 }
 
-std::atomic<bool> DBException::traceExceptions(false);  // NOLINT
+AtomicBool DBException::traceExceptions(false);
 
 string DBException::toString() const {
     stringstream ss;
@@ -83,7 +83,7 @@ string DBException::toString() const {
 }
 
 void DBException::traceIfNeeded(const DBException& e) {
-    if (traceExceptions) {
+    if (traceExceptions.load()) {
         warning() << "DBException thrown" << causedBy(e) << endl;
         printStackTrace();
     }
@@ -127,7 +127,7 @@ NOINLINE_DECL void wasserted(const char* expr, const char* file, unsigned line) 
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
     // this is so we notice in buildbot
     log() << "\n\n***aborting after wassert() failure in a debug/test build\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 #endif
 }
 
@@ -142,7 +142,7 @@ NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned lin
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
     // this is so we notice in buildbot
     log() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 #endif
     throw e;
 }
@@ -158,8 +158,8 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
                                      const Status& status,
                                      const char* file,
                                      unsigned line) noexcept {
-    log() << "Invariant failure: " << expr << " resulted in status " << status << " at " << file
-          << ' ' << dec << line;
+    log() << "Invariant failure: " << expr << " resulted in status " << redact(status) << " at "
+          << file << ' ' << dec << line;
     breakpoint();
     log() << "\n\n***aborting after invariant() failure\n\n" << endl;
     std::abort();
@@ -185,7 +185,8 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusWithLocation(int msgid,
                                                                  const Status& status,
                                                                  const char* file,
                                                                  unsigned line) noexcept {
-    log() << "Fatal assertion " << msgid << " " << status << " at " << file << " " << dec << line;
+    log() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " " << dec
+          << line;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
     std::abort();
@@ -195,7 +196,8 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTraceWithLocation(int msgi
                                                                         const Status& status,
                                                                         const char* file,
                                                                         unsigned line) noexcept {
-    log() << "Fatal assertion " << msgid << " " << status << " at " << file << " " << dec << line;
+    log() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " " << dec
+          << line;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
     quickExit(EXIT_ABRUPT);
@@ -217,7 +219,8 @@ NOINLINE_DECL void uassertedWithLocation(int msgid,
                                          const char* file,
                                          unsigned line) {
     assertionCount.condrollover(++assertionCount.user);
-    log() << "User Assertion: " << msgid << ":" << msg << ' ' << file << ' ' << dec << line << endl;
+    LOG(1) << "User Assertion: " << msgid << ":" << redact(msg) << ' ' << file << ' ' << dec << line
+           << endl;
     throw UserException(msgid, msg);
 }
 
@@ -230,23 +233,34 @@ NOINLINE_DECL void msgassertedWithLocation(int msgid,
                                            const char* file,
                                            unsigned line) {
     assertionCount.condrollover(++assertionCount.warning);
-    log() << "Assertion: " << msgid << ":" << msg << ' ' << file << ' ' << dec << line << endl;
+    log() << "Assertion: " << msgid << ":" << redact(msg) << ' ' << file << ' ' << dec << line
+          << endl;
     logContext();
     throw MsgAssertionException(msgid, msg);
 }
 
-NOINLINE_DECL void msgassertedNoTrace(int msgid, const char* msg) {
+NOINLINE_DECL void msgassertedNoTraceWithLocation(int msgid,
+                                                  const char* msg,
+                                                  const char* file,
+                                                  unsigned line) {
     assertionCount.condrollover(++assertionCount.warning);
-    log() << "Assertion: " << msgid << ":" << msg << endl;
+    log() << "Assertion: " << msgid << ":" << redact(msg) << ' ' << file << ' ' << dec << line
+          << endl;
     throw MsgAssertionException(msgid, msg);
 }
 
-void msgassertedNoTrace(int msgid, const std::string& msg) {
-    msgassertedNoTrace(msgid, msg.c_str());
+void msgassertedNoTraceWithLocation(int msgid,
+                                    const std::string& msg,
+                                    const char* file,
+                                    unsigned line) {
+    msgassertedNoTraceWithLocation(msgid, msg.c_str(), file, line);
 }
 
-void msgassertedNoTraceWithStatus(int msgid, const Status& status) {
-    msgassertedNoTrace(msgid, status.toString());
+void msgassertedNoTraceWithStatusWithLocation(int msgid,
+                                              const Status& status,
+                                              const char* file,
+                                              unsigned line) {
+    msgassertedNoTraceWithLocation(msgid, status.toString(), file, line);
 }
 
 std::string causedBy(const char* e) {

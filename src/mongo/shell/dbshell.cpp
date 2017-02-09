@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/client/dbclientinterface.h"
@@ -49,6 +50,7 @@
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
 #include "mongo/shell/shell_options.h"
@@ -65,6 +67,7 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/static_observer.h"
+#include "mongo/util/stringutils.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -83,7 +86,20 @@ using namespace mongo;
 string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
-static volatile bool atPrompt = false;  // can eval before getting to prompt
+static AtomicBool atPrompt(false);  // can eval before getting to prompt
+
+namespace {
+const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
+
+// We set the featureCompatibilityVersion to 3.4 in the mongo shell so that BSON validation always
+// uses BSONVersion::kLatest.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionSetup"))
+(InitializerContext* context) {
+    mongo::serverGlobalParams.featureCompatibility.version.store(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
+    return Status::OK();
+}
+}
 
 namespace mongo {
 
@@ -165,7 +181,7 @@ void killOps() {
     if (mongo::shell_utils::_nokillop)
         return;
 
-    if (atPrompt)
+    if (atPrompt.load())
         return;
 
     sleepmillis(10);  // give current op a chance to finish
@@ -174,25 +190,20 @@ void killOps() {
         !shellGlobalParams.autoKillOp);
 }
 
-// Stubs for signal_handlers.cpp
-namespace mongo {
-void logProcessDetailsForLogRotate() {}
-}
-
 void quitNicely(int sig) {
     shutdown(EXIT_CLEAN);
 }
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
 char* shellReadline(const char* prompt, int handlesigint = 0) {
-    atPrompt = true;
+    atPrompt.store(true);
 
     char* ret = linenoise(prompt);
     if (!ret) {
         gotInterrupted = true;  // got ^C, break out of multiline
     }
 
-    atPrompt = false;
+    atPrompt.store(false);
     return ret;
 }
 
@@ -200,35 +211,57 @@ void setupSignals() {
     signal(SIGINT, quitNicely);
 }
 
-string fixHost(const std::string& url, const std::string& host, const std::string& port) {
+string getURIFromArgs(const std::string& url, const std::string& host, const std::string& port) {
     if (host.size() == 0 && port.size() == 0) {
-        if (url.find("/") == string::npos) {
-            // check for ips
-            if (url.find(".") != string::npos)
-                return url + "/test";
-
-            if (url.rfind(":") != string::npos && isdigit(url[url.rfind(":") + 1]))
-                return url + "/test";
-        }
-        return url;
+        return url.size() == 0 ? kDefaultMongoURL.toString() : url;
     }
 
+    // The name URL is misleading; really it's just a positional argument that wasn't a file. The
+    // check for "/" means "this 'URL' is probably a real URL and not the db name (e.g.)".
     if (url.find("/") != string::npos) {
-        cerr << "url can't have host or port if you specify them individually" << endl;
+        cerr << "if a full URI is provided, you cannot also specify host or port" << endl;
         quickExit(-1);
     }
 
-    string newurl((host.size() == 0) ? "127.0.0.1" : host);
-    if (port.size() > 0)
-        newurl += ":" + port;
-    else if (host.find(':') == string::npos) {
-        // need to add port with IPv6 addresses
-        newurl += ":27017";
+    bool hostEndsInSock = str::endsWith(host, ".sock");
+
+    // If host looks like a full URI (i.e. has a slash and isn't a unix socket) and the other fields
+    // are empty, then just return host.
+    std::string::size_type slashPos;
+    if (url.size() == 0 && port.size() == 0 &&
+        (!hostEndsInSock && ((slashPos = host.find("/")) != string::npos))) {
+        if (str::startsWith(host, "mongodb://")) {
+            return host;
+        }
+        // If there's a slash in the host field, then it's the replica set name, not a database name
+        stringstream ss;
+        ss << "mongodb://" << host.substr(slashPos + 1)
+           << "/?replicaSet=" << host.substr(0, slashPos);
+        return ss.str();
     }
 
-    newurl += "/" + url;
+    stringstream ss;
+    if (host.size() == 0) {
+        ss << "mongodb://127.0.0.1";
+    } else {
+        if (!str::startsWith(host, "mongodb://")) {
+            ss << "mongodb://";
+        }
+        ss << host;
+    }
 
-    return newurl;
+    if (!hostEndsInSock) {
+        if (port.size() > 0) {
+            ss << ":" << port;
+        } else if (host.find(':') == string::npos || str::endsWith(host, "]")) {
+            // Default the port to 27017 if the host did not provide one (i.e. the host has no
+            // colons or ends in ']' like an IPv6 address).
+            ss << ":27017";
+        }
+    }
+
+    ss << "/" << url;
+    return ss.str();
 }
 
 static string OpSymbols = "~!%^&*-+=|:,<>/?.";
@@ -585,8 +618,6 @@ int _main(int argc, char* argv[], char** envp) {
 
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
-    shellGlobalParams.url = "test";
-
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
 
     // hide password from ps output
@@ -599,8 +630,8 @@ int _main(int argc, char* argv[], char** envp) {
         }
     }
 
-    if (!mongo::serverGlobalParams.quiet)
-        cout << "MongoDB shell version: " << mongo::versionString << endl;
+    if (!mongo::serverGlobalParams.quiet.load())
+        cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
 
     mongo::StartupTest::runTests();
 
@@ -612,10 +643,11 @@ int _main(int argc, char* argv[], char** envp) {
 
     if (!shellGlobalParams.nodb) {  // connect to db
         stringstream ss;
-        if (mongo::serverGlobalParams.quiet)
+        if (mongo::serverGlobalParams.quiet.load())
             ss << "__quiet = true;";
         ss << "db = connect( \""
-           << fixHost(shellGlobalParams.url, shellGlobalParams.dbhost, shellGlobalParams.port)
+           << getURIFromArgs(
+                  shellGlobalParams.url, shellGlobalParams.dbhost, shellGlobalParams.port)
            << "\")";
 
         mongo::shell_utils::_dbConnect = ss.str();
@@ -647,7 +679,8 @@ int _main(int argc, char* argv[], char** envp) {
                          << escape(shellGlobalParams.gssapiServiceName) << "\";" << endl;
     }
 
-    if (!shellGlobalParams.nodb && shellGlobalParams.username.size()) {
+    if (!shellGlobalParams.nodb && (!shellGlobalParams.username.empty() ||
+                                    shellGlobalParams.authenticationMechanism == "MONGODB-X509")) {
         authStringStream << "var username = \"" << escape(shellGlobalParams.username) << "\";"
                          << endl;
         if (shellGlobalParams.usingPassword) {
@@ -660,11 +693,14 @@ int _main(int argc, char* argv[], char** envp) {
             authStringStream << "var authDb = db.getSiblingDB(\""
                              << escape(shellGlobalParams.authenticationDatabase) << "\");" << endl;
         }
-        authStringStream << "authDb._authOrThrow({ " << saslCommandUserFieldName << ": username ";
+
+        authStringStream << "authDb._authOrThrow({ ";
+        if (!shellGlobalParams.username.empty()) {
+            authStringStream << saslCommandUserFieldName << ": username ";
+        }
         if (shellGlobalParams.usingPassword) {
             authStringStream << ", " << saslCommandPasswordFieldName << ": password ";
         }
-
         if (!shellGlobalParams.gssapiHostName.empty()) {
             authStringStream << ", " << saslCommandServiceHostnameFieldName << ": \""
                              << escape(shellGlobalParams.gssapiHostName) << '"' << endl;
@@ -676,13 +712,15 @@ int _main(int argc, char* argv[], char** envp) {
 
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
     mongo::ScriptEngine::setup();
-    mongo::globalScriptEngine->setScopeInitCallback(mongo::shell_utils::initScope);
-    mongo::globalScriptEngine->enableJIT(!shellGlobalParams.nojit);
-    mongo::globalScriptEngine->enableJavaScriptProtection(shellGlobalParams.javascriptProtection);
+    mongo::getGlobalScriptEngine()->setJSHeapLimitMB(shellGlobalParams.jsHeapLimitMB);
+    mongo::getGlobalScriptEngine()->setScopeInitCallback(mongo::shell_utils::initScope);
+    mongo::getGlobalScriptEngine()->enableJIT(!shellGlobalParams.nojit);
+    mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
+        shellGlobalParams.javascriptProtection);
 
     auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
 
-    unique_ptr<mongo::Scope> scope(mongo::globalScriptEngine->newScope());
+    unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
     if (shellGlobalParams.runShell)
@@ -720,6 +758,9 @@ int _main(int argc, char* argv[], char** envp) {
 
         if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
             cout << "failed to load: " << shellGlobalParams.files[i] << endl;
+            return -3;
+        }
+        if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
             return -3;
         }
     }
@@ -765,9 +806,16 @@ int _main(int argc, char* argv[], char** envp) {
             f.open(rcLocation.c_str(), false);  // Create empty .mongorc.js file
         }
 
-        if (!shellGlobalParams.nodb && !mongo::serverGlobalParams.quiet && isatty(fileno(stdin))) {
+        if (!shellGlobalParams.nodb && !mongo::serverGlobalParams.quiet.load() &&
+            isatty(fileno(stdin))) {
             scope->exec(
-                "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings", false, true, false);
+                "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings)", false, true, false);
+
+            scope->exec("shellHelper( 'show', 'automationNotices' )",
+                        "(automationnotices)",
+                        false,
+                        true,
+                        false);
         }
 
         shellHistoryInit();
@@ -800,7 +848,7 @@ int _main(int argc, char* argv[], char** envp) {
             }
 
             if (!linePtr || (strlen(linePtr) == 4 && strstr(linePtr, "exit"))) {
-                if (!mongo::serverGlobalParams.quiet)
+                if (!mongo::serverGlobalParams.quiet.load())
                     cout << "bye" << endl;
                 if (line)
                     free(line);

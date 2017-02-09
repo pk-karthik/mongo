@@ -41,7 +41,9 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/version_manager.h"
+#include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/is_mongos.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -179,7 +181,7 @@ public:
             if (ss->avail) {
                 // If we're shutting down, don't want to initiate release mechanism as it is
                 // slow, and isn't needed since all connections will be closed anyway.
-                if (inShutdown()) {
+                if (globalInShutdownDeprecated()) {
                     if (versionManager.isVersionableCB(ss->avail)) {
                         versionManager.resetShardVersionCB(ss->avail);
                     }
@@ -239,7 +241,7 @@ public:
             warning() << "Detected additional sharded connection in the "
                       << "thread local pool for " << addr;
 
-            if (DBException::traceExceptions) {
+            if (DBException::traceExceptions.load()) {
                 // There shouldn't be more than one connection checked out to the same
                 // host on the same thread.
                 printStackTrace();
@@ -281,10 +283,12 @@ public:
         // Now only check top-level shard connections
         for (const ShardId& shardId : all) {
             try {
-                const auto shard = grid.shardRegistry()->getShard(txn, shardId);
-                if (!shard) {
+                auto shardStatus = grid.shardRegistry()->getShard(txn, shardId);
+                if (!shardStatus.isOK()) {
+                    invariant(shardStatus == ErrorCodes::ShardNotFound);
                     continue;
                 }
+                const auto shard = shardStatus.getValue();
 
                 string sconnString = shard->getConnString().toString();
                 Status* s = _getStatus(sconnString);
@@ -399,9 +403,6 @@ thread_specific_ptr<ClientConnections> ClientConnections::_perThread;
 // The global connection pool
 DBConnectionPool shardConnectionPool;
 
-// Different between mongos and mongod
-void usingAShardConnection(const string& addr);
-
 ShardConnection::ShardConnection(const ConnectionString& connectionString,
                                  const string& ns,
                                  std::shared_ptr<ChunkManager> manager)
@@ -413,8 +414,13 @@ ShardConnection::ShardConnection(const ConnectionString& connectionString,
         invariant(_manager->getns() == _ns);
     }
 
-    _conn = ClientConnections::threadInstance()->get(_cs.toString(), _ns);
-    usingAShardConnection(_cs.toString());
+    auto csString = _cs.toString();
+    _conn = ClientConnections::threadInstance()->get(csString, _ns);
+    if (isMongos()) {
+        // In mongos, we record this connection as having been used for useful work to provide
+        // useful information in getLastError.
+        ClusterLastErrorInfo::get(cc()).addShardHost(csString);
+    }
 }
 
 ShardConnection::~ShardConnection() {

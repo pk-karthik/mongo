@@ -79,8 +79,9 @@ private:
 };
 
 void ElectCmdRunnerTest::setUp() {
-    _net = new NetworkInterfaceMock;
-    _executor = stdx::make_unique<ReplicationExecutor>(_net, 1 /* prng seed */);
+    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    _net = net.get();
+    _executor = stdx::make_unique<ReplicationExecutor>(std::move(net), 1 /* prng seed */);
     _executorThread.reset(new stdx::thread(stdx::bind(&ReplicationExecutor::run, _executor.get())));
 }
 
@@ -199,7 +200,7 @@ TEST_F(ElectCmdRunnerTest, TwoNodes) {
     _net->enterNetwork();
     const NetworkInterfaceMock::NetworkOperationIterator noi = _net->getNextReadyRequest();
     ASSERT_EQUALS("admin", noi->getRequest().dbname);
-    ASSERT_EQUALS(stripRound(electRequest), stripRound(noi->getRequest().cmdObj));
+    ASSERT_BSONOBJ_EQ(stripRound(electRequest), stripRound(noi->getRequest().cmdObj));
     ASSERT_EQUALS(HostAndPort("h1"), noi->getRequest().target);
     _net->scheduleResponse(noi,
                            startDate + Milliseconds(10),
@@ -287,6 +288,7 @@ protected:
         return RemoteCommandRequest(HostAndPort(hostname),
                                     "",  // the non-hostname fields do not matter for Elect
                                     BSONObj(),
+                                    nullptr,
                                     Milliseconds(0));
     }
 

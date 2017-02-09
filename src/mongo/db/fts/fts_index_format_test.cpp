@@ -34,6 +34,8 @@
 
 #include <set>
 
+#include "mongo/bson/json.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/unittest/unittest.h"
@@ -50,7 +52,7 @@ using unittest::assertGet;
 TEST(FTSIndexFormat, Simple1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "cat sat"),
@@ -69,7 +71,7 @@ TEST(FTSIndexFormat, ExtraBack1) {
                                                                << "text"
                                                                << "x"
                                                                << 1)))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "cat"
@@ -89,7 +91,7 @@ TEST(FTSIndexFormat, ExtraBack1) {
 TEST(FTSIndexFormat, ExtraFront1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << 1 << "data"
                                                                    << "text")))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "cat"
@@ -110,14 +112,14 @@ TEST(FTSIndexFormat, StopWords1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")))));
 
-    BSONObjSet keys1;
+    BSONObjSet keys1 = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "computer"),
                             &keys1);
     ASSERT_EQUALS(1U, keys1.size());
 
-    BSONObjSet keys2;
+    BSONObjSet keys2 = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     FTSIndexFormat::getKeys(spec,
                             BSON("data"
                                  << "any computer"),
@@ -159,7 +161,7 @@ TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
                                                                << "text")
                                                        << "textIndexVersion"
                                                        << 1))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
@@ -189,7 +191,7 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
                                                                << "text")
                                                        << "textIndexVersion"
                                                        << 2))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
@@ -224,7 +226,7 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
                                                                << "text")
                                                        << "textIndexVersion"
                                                        << 3))));
-    BSONObjSet keys;
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
     string longWordCat = longPrefix + "cat";
@@ -248,5 +250,80 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
 
     assertEqualsIndexKeys(expectedKeys, keys);
 }
+
+TEST(FTSIndexFormat, GetKeysWithLeadingEmptyArrayThrows) {
+    BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+                       UserException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
+
+TEST(FTSIndexFormat, GetKeysWithTrailingEmptyArrayThrows) {
+    BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+                       UserException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
+
+TEST(FTSIndexFormat, GetKeysWithLeadingSingleElementArrayThrows) {
+    BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+                       UserException,
+                       ErrorCodes::CannotBuildIndexKeys);
+}
+
+TEST(FTSIndexFormat, GetKeysWithTrailingSingleElementArrayThrows) {
+    BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+                       UserException,
+                       ErrorCodes::CannotBuildIndexKeys);
+}
+
+TEST(FTSIndexFormat, GetKeysWithMultiElementArrayThrows) {
+    BSONObj keyPattern = fromjson("{'a.b': 1, 'a.c': 'text'}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: [{b: 9, c: 'foo'}, {b: 10, c: 'bar'}]}");
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(spec, objToIndex, &keys),
+                       UserException,
+                       ErrorCodes::CannotBuildIndexKeys);
+}
+
+TEST(FTSIndexFormat, GetKeysWithPositionalPathAllowed) {
+    BSONObj keyPattern = fromjson("{'a.0': 1, 'a.b': 'text'}");
+    FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    BSONObj objToIndex = fromjson("{a: [{b: 'foo'}, {b: 'bar'}]}");
+    FTSIndexFormat::getKeys(spec, objToIndex, &keys);
+    ASSERT_EQ(2U, keys.size());
+
+    {
+        BSONObj key = *(keys.begin());
+        ASSERT_EQ(3, key.nFields());
+        BSONObjIterator it{key};
+        ASSERT_BSONELT_EQ(it.next(), fromjson("{'': {b: 'foo'}}").firstElement());
+        ASSERT_BSONELT_EQ(it.next(), fromjson("{'': 'bar'}").firstElement());
+    }
+
+    {
+        BSONObj key = *(++keys.begin());
+        ASSERT_EQ(3, key.nFields());
+        BSONObjIterator it{key};
+        ASSERT_BSONELT_EQ(it.next(), fromjson("{'': {b: 'foo'}}").firstElement());
+        ASSERT_BSONELT_EQ(it.next(), fromjson("{'': 'foo'}").firstElement());
+    }
+}
+}  // namespace fts
+}  // namespace mongo

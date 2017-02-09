@@ -54,6 +54,10 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
+ReplicationExecutor* ReplCoordTest::getReplExec() {
+    return _repl->getExecutor();
+}
+
 ReplicaSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
     ReplicaSetConfig config;
     ASSERT_OK(config.initialize(configBson));
@@ -109,26 +113,30 @@ void ReplCoordTest::init() {
     invariant(!_repl);
     invariant(!_callShutdown);
 
-    auto serviceContext = getGlobalServiceContext();
+    auto service = getGlobalServiceContext();
     StorageInterface* storageInterface = new StorageInterfaceMock();
-    StorageInterface::set(serviceContext, std::unique_ptr<StorageInterface>(storageInterface));
-    ASSERT_TRUE(storageInterface == StorageInterface::get(serviceContext));
+    StorageInterface::set(service, std::unique_ptr<StorageInterface>(storageInterface));
+    ASSERT_TRUE(storageInterface == StorageInterface::get(service));
     // PRNG seed for tests.
     const int64_t seed = 0;
 
     TopologyCoordinatorImpl::Options settings;
-    _topo = new TopologyCoordinatorImpl(settings);
-    stdx::function<bool()> _durablityLambda = [this]() -> bool { return _isStorageEngineDurable; };
-    _net = new NetworkInterfaceMock;
-    _replExec = stdx::make_unique<ReplicationExecutor>(_net, seed);
-    _externalState = new ReplicationCoordinatorExternalStateMock;
-    _repl.reset(new ReplicationCoordinatorImpl(_settings,
-                                               _externalState,
-                                               _topo,
-                                               storageInterface,
-                                               _replExec.get(),
-                                               seed,
-                                               &_durablityLambda));
+    auto topo = stdx::make_unique<TopologyCoordinatorImpl>(settings);
+    _topo = topo.get();
+    auto net = stdx::make_unique<NetworkInterfaceMock>();
+    _net = net.get();
+    auto externalState = stdx::make_unique<ReplicationCoordinatorExternalStateMock>();
+    _externalState = externalState.get();
+    _repl = stdx::make_unique<ReplicationCoordinatorImpl>(service,
+                                                          _settings,
+                                                          std::move(externalState),
+                                                          std::move(net),
+                                                          std::move(topo),
+                                                          storageInterface,
+                                                          seed);
+    service->setFastClockSource(stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+    service->setPreciseClockSource(
+        stdx::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -150,7 +158,7 @@ void ReplCoordTest::start() {
 
     const auto txn = makeOperationContext();
     _repl->startup(txn.get());
-    _repl->waitForStartUpComplete();
+    _repl->waitForStartUpComplete_forTest();
     _callShutdown = true;
 }
 
@@ -277,12 +285,16 @@ void ReplCoordTest::simulateSuccessfulDryRun() {
 }
 
 void ReplCoordTest::simulateSuccessfulV1Election() {
-    ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    NetworkInterfaceMock* net = getNet();
-
-    auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
     log() << "Election timeout scheduled at " << electionTimeoutWhen << " (simulator time)";
+
+    simulateSuccessfulV1ElectionAt(electionTimeoutWhen);
+}
+
+void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
+    ReplicationCoordinatorImpl* replCoord = getReplCoord();
+    NetworkInterfaceMock* net = getNet();
 
     ReplicaSetConfig rsConfig = replCoord->getReplicaSetConfig_forTest();
     ASSERT(replCoord->getMemberState().secondary()) << replCoord->getMemberState().toString();
@@ -292,8 +304,8 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
     while (!replCoord->getMemberState().primary() || hasReadyRequests) {
         log() << "Waiting on network in state " << replCoord->getMemberState();
         getNet()->enterNetwork();
-        if (net->now() < electionTimeoutWhen) {
-            net->runUntil(electionTimeoutWhen);
+        if (net->now() < electionTime) {
+            net->runUntil(electionTime);
         }
         const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
         const RemoteCommandRequest& request = noi->getRequest();
@@ -315,6 +327,10 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
                                                                << request.cmdObj["term"].Long()
                                                                << "voteGranted"
                                                                << true)));
+        } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetGetStatus") {
+            // OpTime part of replSetGetStatus for use by FreshnessScanner during catch-up period.
+            BSONObj response = BSON("optimes" << BSON("appliedOpTime" << OpTime().toBSON()));
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(response));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
@@ -457,6 +473,34 @@ void ReplCoordTest::disableReadConcernMajoritySupport() {
 
 void ReplCoordTest::disableSnapshots() {
     _externalState->setAreSnapshotsEnabled(false);
+}
+
+void ReplCoordTest::simulateCatchUpTimeout() {
+    NetworkInterfaceMock* net = getNet();
+    auto catchUpTimeoutWhen = net->now() + getReplCoord()->getConfig().getCatchUpTimeoutPeriod();
+    bool hasRequest = false;
+    net->enterNetwork();
+    if (net->now() < catchUpTimeoutWhen) {
+        net->runUntil(catchUpTimeoutWhen);
+    }
+    hasRequest = net->hasReadyRequests();
+    net->exitNetwork();
+
+    while (hasRequest) {
+        net->enterNetwork();
+        auto noi = net->getNextReadyRequest();
+        auto request = noi->getRequest();
+        // Black hole heartbeat requests caused by time advance.
+        log() << "Black holing request to " << request.target.toString() << " : " << request.cmdObj;
+        net->blackHole(noi);
+        if (net->now() < catchUpTimeoutWhen) {
+            net->runUntil(catchUpTimeoutWhen);
+        } else {
+            net->runReadyNetworkOperations();
+        }
+        hasRequest = net->hasReadyRequests();
+        net->exitNetwork();
+    }
 }
 
 }  // namespace repl

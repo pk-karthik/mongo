@@ -196,7 +196,7 @@ void InclusionNode::addComputedField(const FieldPath& path, boost::intrusive_ptr
         _orderToProcessAdditionsAndChildren.push_back(fieldName);
         return;
     }
-    addOrGetChild(path.getFieldName(0))->addComputedField(path.tail(), expr);
+    addOrGetChild(path.getFieldName(0).toString())->addComputedField(path.tail(), expr);
 }
 
 void InclusionNode::addIncludedField(const FieldPath& path) {
@@ -204,7 +204,7 @@ void InclusionNode::addIncludedField(const FieldPath& path) {
         _inclusions.insert(path.fullPath());
         return;
     }
-    addOrGetChild(path.getFieldName(0))->addIncludedField(path.tail());
+    addOrGetChild(path.getFieldName(0).toString())->addIncludedField(path.tail());
 }
 
 InclusionNode* InclusionNode::addOrGetChild(std::string field) {
@@ -226,11 +226,33 @@ InclusionNode* InclusionNode::addChild(string field) {
     return insertedPair.first->second.get();
 }
 
+void InclusionNode::addPreservedPaths(std::set<std::string>* preservedPaths) const {
+    // Only our inclusion paths are preserved. This inclusion node may also have paths with
+    // associated expressions, but those paths are modified and therefore are not considered
+    // "preserved".
+    for (auto&& includedField : _inclusions) {
+        preservedPaths->insert(FieldPath::getFullyQualifiedPath(_pathToNode, includedField));
+    }
+    for (auto&& childPair : _children) {
+        childPair.second->addPreservedPaths(preservedPaths);
+    }
+}
+
+void InclusionNode::addComputedPaths(std::set<std::string>* computedPaths) const {
+    for (auto&& computedPair : _expressions) {
+        computedPaths->insert(FieldPath::getFullyQualifiedPath(_pathToNode, computedPair.first));
+    }
+    for (auto&& childPair : _children) {
+        childPair.second->addComputedPaths(computedPaths);
+    }
+}
+
 //
 // ParsedInclusionProjection
 //
 
-void ParsedInclusionProjection::parse(const BSONObj& spec,
+void ParsedInclusionProjection::parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      const BSONObj& spec,
                                       const VariablesParseState& variablesParseState) {
     // It is illegal to specify a projection with no output fields.
     bool atLeastOneFieldInOutput = false;
@@ -267,7 +289,7 @@ void ParsedInclusionProjection::parse(const BSONObj& spec,
             }
             case BSONType::Object: {
                 // This is either an expression, or a nested specification.
-                if (parseObjectAsExpression(fieldName, elem.Obj(), variablesParseState)) {
+                if (parseObjectAsExpression(expCtx, fieldName, elem.Obj(), variablesParseState)) {
                     // It was an expression.
                     break;
                 }
@@ -277,20 +299,21 @@ void ParsedInclusionProjection::parse(const BSONObj& spec,
                 auto remainingPath = FieldPath(elem.fieldName());
                 auto child = _root.get();
                 while (remainingPath.getPathLength() > 1) {
-                    child = child->addOrGetChild(remainingPath.getFieldName(0));
+                    child = child->addOrGetChild(remainingPath.getFieldName(0).toString());
                     remainingPath = remainingPath.tail();
                 }
                 // It is illegal to construct an empty FieldPath, so the above loop ends one
                 // iteration too soon. Add the last path here.
                 child = child->addOrGetChild(remainingPath.fullPath());
 
-                parseSubObject(elem.Obj(), variablesParseState, child);
+                parseSubObject(expCtx, elem.Obj(), variablesParseState, child);
                 break;
             }
             default: {
                 // This is a literal value.
-                _root->addComputedField(FieldPath(elem.fieldName()),
-                                        Expression::parseOperand(elem, variablesParseState));
+                _root->addComputedField(
+                    FieldPath(elem.fieldName()),
+                    Expression::parseOperand(expCtx, elem, variablesParseState));
             }
         }
     }
@@ -321,6 +344,7 @@ Document ParsedInclusionProjection::applyProjection(Document inputDoc, Variables
 }
 
 bool ParsedInclusionProjection::parseObjectAsExpression(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     StringData pathToObject,
     const BSONObj& objSpec,
     const VariablesParseState& variablesParseState) {
@@ -328,16 +352,18 @@ bool ParsedInclusionProjection::parseObjectAsExpression(
         // This is an expression like {$add: [...]}. We have already verified that it has only one
         // field.
         invariant(objSpec.nFields() == 1);
-        _root->addComputedField(pathToObject.toString(),
-                                Expression::parseExpression(objSpec, variablesParseState));
+        _root->addComputedField(pathToObject,
+                                Expression::parseExpression(expCtx, objSpec, variablesParseState));
         return true;
     }
     return false;
 }
 
-void ParsedInclusionProjection::parseSubObject(const BSONObj& subObj,
-                                               const VariablesParseState& variablesParseState,
-                                               InclusionNode* node) {
+void ParsedInclusionProjection::parseSubObject(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const BSONObj& subObj,
+    const VariablesParseState& variablesParseState,
+    InclusionNode* node) {
     for (auto elem : subObj) {
         invariant(elem.fieldName()[0] != '$');
         // Dotted paths in a sub-object have already been disallowed in
@@ -359,19 +385,20 @@ void ParsedInclusionProjection::parseSubObject(const BSONObj& subObj,
                 // This is either an expression, or a nested specification.
                 auto fieldName = elem.fieldNameStringData().toString();
                 if (parseObjectAsExpression(
+                        expCtx,
                         FieldPath::getFullyQualifiedPath(node->getPath(), fieldName),
                         elem.Obj(),
                         variablesParseState)) {
                     break;
                 }
                 auto child = node->addOrGetChild(fieldName);
-                parseSubObject(elem.Obj(), variablesParseState, child);
+                parseSubObject(expCtx, elem.Obj(), variablesParseState, child);
                 break;
             }
             default: {
                 // This is a literal value.
                 node->addComputedField(FieldPath(elem.fieldName()),
-                                       Expression::parseOperand(elem, variablesParseState));
+                                       Expression::parseOperand(expCtx, elem, variablesParseState));
             }
         }
     }

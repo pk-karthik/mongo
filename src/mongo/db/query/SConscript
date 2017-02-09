@@ -2,9 +2,14 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.SConscript(
     dirs=[
         "collation",
+    ],
+    exports=[
+        'env'
     ],
 )
 
@@ -42,6 +47,16 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target="query_settings_test",
+    source=[
+        "query_settings_test.cpp",
+    ],
+    LIBDEPS=[
+        "query_planner"
+    ]
+)
+
 env.Library(
     target='query',
     source=[
@@ -62,12 +77,17 @@ env.Library(
         "$BUILD_DIR/mongo/db/curop",
         "$BUILD_DIR/mongo/db/exec/exec",
         "$BUILD_DIR/mongo/db/s/sharding",
+        "$BUILD_DIR/mongo/db/storage/oplog_hack",
+        "$BUILD_DIR/mongo/util/elapsed_tracker",
+        #"$BUILD_DIR/mongo/db/matcher/expressions_mongod_only", # CYCLE
+        #'$BUILD_DIR/mongo/db/clientcursor',, # CYCLE
+        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
+        #'$BUILD_DIR/mongo/db/ops/write_ops', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Depends on files from serverOnlyFiles, and has many other
-        # missing dependencies.
-        'incomplete',
-    ]
+        # TODO(ADAM, 2017-01-09): See `CYCLE` tags above.
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+    ],
 )
 
 # Shared mongod/mongos query code.
@@ -85,6 +105,19 @@ env.Library(
         "collation/collator_icu",
         "query_planner",
         "query_request",
+    ],
+)
+
+env.CppUnitTest(
+    target="parsed_distinct_test",
+    source=[
+        "parsed_distinct_test.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        "query_test_service_context",
+        "query_common",
     ],
 )
 
@@ -131,6 +164,7 @@ env.Library(
         'getmore_request.cpp',
         'killcursors_request.cpp',
         'killcursors_response.cpp',
+        'view_response_formatter.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -152,8 +186,10 @@ env.CppUnitTest(
         'getmore_request_test.cpp',
         'killcursors_request_test.cpp',
         'killcursors_response_test.cpp',
+        'view_response_formatter_test.cpp',
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         'command_request_response',
     ]
 )
@@ -167,10 +203,11 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/exec/exec',
         '$BUILD_DIR/mongo/db/exec/working_set',
+        #'$BUILD_DIR/mongo/db/query/query', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Circular with the 'query' library in this directory
-        'incomplete',
+        # TODO(ADAM, 2017-01-09): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -268,6 +305,7 @@ env.CppUnitTest(
         "query_request_test.cpp"
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         "query_request",
     ],
 )

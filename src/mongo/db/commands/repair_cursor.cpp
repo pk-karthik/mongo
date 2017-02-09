@@ -38,6 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 
 namespace mongo {
@@ -55,7 +56,7 @@ public:
         return true;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         ActionSet actions;
@@ -74,7 +75,7 @@ public:
                      BSONObjBuilder& result) {
         NamespaceString ns(parseNs(dbname, cmdObj));
 
-        AutoGetCollectionForRead ctx(txn, ns.ns());
+        AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
         if (!collection) {
@@ -105,15 +106,13 @@ public:
         exec->saveState();
         exec->detachFromOperationContext();
 
-        // ClientCursors' constructor inserts them into a global map that manages their
-        // lifetimes. That is why the next line isn't leaky.
-        ClientCursor* cc =
-            new ClientCursor(collection->getCursorManager(),
-                             exec.release(),
-                             ns.ns(),
-                             txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
+        auto pinnedCursor = collection->getCursorManager()->registerCursor(
+            {exec.release(),
+             ns.ns(),
+             txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot()});
 
-        appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &result);
+        appendCursorResponseObject(
+            pinnedCursor.getCursor()->cursorid(), ns.ns(), BSONArray(), &result);
 
         return true;
     }

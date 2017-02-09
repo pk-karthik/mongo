@@ -30,6 +30,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
+#include "mongo/platform/basic.h"
+
 #include <string>
 #include <vector>
 
@@ -45,18 +47,21 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/parsed_distinct.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/views/resolved_view.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -112,8 +117,7 @@ public:
                            ExplainCommon::Verbosity verbosity,
                            const rpc::ServerSelectionMetadata&,
                            BSONObjBuilder* out) const {
-        const string ns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(ns);
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
         const ExtensionsCallbackReal extensionsCallback(txn, &nss);
         auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, true);
@@ -121,12 +125,32 @@ public:
             return parsedDistinct.getStatus();
         }
 
-        AutoGetCollectionForRead ctx(txn, ns);
+        if (!parsedDistinct.getValue().getQuery()->getQueryRequest().getCollation().isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+        }
 
+        AutoGetCollectionOrViewForRead ctx(txn, nss);
         Collection* collection = ctx.getCollection();
 
+        if (ctx.getView()) {
+            ctx.releaseLocksForView();
+
+            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
+            if (!viewAggregation.isOK()) {
+                return viewAggregation.getStatus();
+            }
+            std::string errmsg;
+            (void)Command::findCommand("aggregate")
+                ->run(txn, dbname, viewAggregation.getValue(), 0, errmsg, *out);
+            return Status::OK();
+        }
+
         auto executor = getExecutorDistinct(
-            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
+            txn, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return executor.getStatus();
         }
@@ -138,13 +162,10 @@ public:
     bool run(OperationContext* txn,
              const string& dbname,
              BSONObj& cmdObj,
-             int,
+             int options,
              string& errmsg,
              BSONObjBuilder& result) {
-        Timer t;
-
-        const string ns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(ns);
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
         const ExtensionsCallbackReal extensionsCallback(txn, &nss);
         auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, false);
@@ -152,18 +173,52 @@ public:
             return appendCommandStatus(result, parsedDistinct.getStatus());
         }
 
-        AutoGetCollectionForRead ctx(txn, ns);
+        if (!parsedDistinct.getValue().getQuery()->getQueryRequest().getCollation().isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::InvalidOptions,
+                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
+        }
 
+        AutoGetCollectionOrViewForRead ctx(txn, nss);
         Collection* collection = ctx.getCollection();
 
+        if (ctx.getView()) {
+            ctx.releaseLocksForView();
+
+            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
+            if (!viewAggregation.isOK()) {
+                return appendCommandStatus(result, viewAggregation.getStatus());
+            }
+            BSONObjBuilder aggResult;
+
+            (void)Command::findCommand("aggregate")
+                ->run(txn, dbname, viewAggregation.getValue(), options, errmsg, aggResult);
+
+            if (ResolvedView::isResolvedViewErrorResponse(aggResult.asTempObj())) {
+                result.appendElements(aggResult.obj());
+                return false;
+            }
+
+            ViewResponseFormatter formatter(aggResult.obj());
+            Status formatStatus = formatter.appendAsDistinctResponse(&result);
+            if (!formatStatus.isOK()) {
+                return appendCommandStatus(result, formatStatus);
+            }
+            return true;
+        }
+
         auto executor = getExecutorDistinct(
-            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
+            txn, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return appendCommandStatus(result, executor.getStatus());
         }
 
         {
-            stdx::lock_guard<Client>(*txn->getClient());
+            stdx::lock_guard<Client> lk(*txn->getClient());
             CurOp::get(txn)->setPlanSummary_inlock(
                 Explain::getPlanSummary(executor.getValue().get()));
         }
@@ -208,8 +263,8 @@ public:
         // Return an error if execution fails for any reason.
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             log() << "Plan executor error during distinct command: "
-                  << PlanExecutor::statestr(state)
-                  << ", stats: " << Explain::getWinningPlanStats(executor.getValue().get());
+                  << redact(PlanExecutor::statestr(state))
+                  << ", stats: " << redact(Explain::getWinningPlanStats(executor.getValue().get()));
 
             return appendCommandStatus(result,
                                        Status(ErrorCodes::OperationFailed,
@@ -229,7 +284,7 @@ public:
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 
-        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+        if (curOp->shouldDBProfile()) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(executor.getValue().get(), &execStatsBob);
             curOp->debug().execStats = execStatsBob.obj();
@@ -238,16 +293,6 @@ public:
         verify(start == bb.buf());
 
         result.appendArray("values", arr.done());
-
-        {
-            BSONObjBuilder b;
-            b.appendNumber("n", stats.nReturned);
-            b.appendNumber("nscanned", stats.totalKeysExamined);
-            b.appendNumber("nscannedObjects", stats.totalDocsExamined);
-            b.appendNumber("timems", t.millis());
-            b.append("planSummary", Explain::getPlanSummary(executor.getValue().get()));
-            result.append("stats", b.obj());
-        }
 
         return true;
     }

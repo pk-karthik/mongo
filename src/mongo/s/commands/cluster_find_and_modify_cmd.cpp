@@ -32,18 +32,21 @@
 #include <vector>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_explain.h"
+#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/sharding_raii.h"
@@ -89,17 +92,31 @@ public:
         const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);
 
         auto scopedDB = uassertStatusOK(ScopedShardDatabase::getExisting(txn, dbName));
-        DBConfig* conf = scopedDB.db();
+        const auto conf = scopedDB.db();
 
         shared_ptr<ChunkManager> chunkMgr;
         shared_ptr<Shard> shard;
 
-        if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
-            shard = Grid::get(txn)->shardRegistry()->getShard(txn, conf->getPrimaryId());
+        if (!conf->isSharded(nss.ns())) {
+            auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(txn, conf->getPrimaryId());
+            if (!shardStatus.isOK()) {
+                return shardStatus.getStatus();
+            }
+            shard = shardStatus.getValue();
         } else {
             chunkMgr = _getChunkManager(txn, conf, nss);
 
             const BSONObj query = cmdObj.getObjectField("query");
+
+            BSONObj collation;
+            BSONElement collationElement;
+            auto collationElementStatus =
+                bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
+            if (collationElementStatus.isOK()) {
+                collation = collationElement.Obj();
+            } else if (collationElementStatus != ErrorCodes::NoSuchKey) {
+                return collationElementStatus;
+            }
 
             StatusWith<BSONObj> status = _getShardKey(txn, chunkMgr, query);
             if (!status.isOK()) {
@@ -107,9 +124,20 @@ public:
             }
 
             BSONObj shardKey = status.getValue();
-            shared_ptr<Chunk> chunk = chunkMgr->findIntersectingChunk(txn, shardKey);
+            auto chunk = chunkMgr->findIntersectingChunk(txn, shardKey, collation);
 
-            shard = Grid::get(txn)->shardRegistry()->getShard(txn, chunk->getShardId());
+            if (!chunk.isOK()) {
+                uasserted(ErrorCodes::ShardKeyNotFound,
+                          "findAndModify must target a single shard, but was not able to due "
+                          "to non-simple collation");
+            }
+
+            auto shardStatus =
+                Grid::get(txn)->shardRegistry()->getShard(txn, chunk.getValue()->getShardId());
+            if (!shardStatus.isOK()) {
+                return shardStatus.getStatus();
+            }
+            shard = shardStatus.getValue();
         }
 
         BSONObjBuilder explainCmd;
@@ -153,15 +181,25 @@ public:
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
         auto scopedDb = uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, dbName));
-        DBConfig* conf = scopedDb.db();
+        const auto conf = scopedDb.db();
 
-        if (!conf->isShardingEnabled() || !conf->isSharded(nss.ns())) {
+        if (!conf->isSharded(nss.ns())) {
             return _runCommand(txn, conf, nullptr, conf->getPrimaryId(), nss, cmdObj, result);
         }
 
         shared_ptr<ChunkManager> chunkMgr = _getChunkManager(txn, conf, nss);
 
         const BSONObj query = cmdObj.getObjectField("query");
+
+        BSONObj collation;
+        BSONElement collationElement;
+        auto collationElementStatus =
+            bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
+        if (collationElementStatus.isOK()) {
+            collation = collationElement.Obj();
+        } else if (collationElementStatus != ErrorCodes::NoSuchKey) {
+            return appendCommandStatus(result, collationElementStatus);
+        }
 
         StatusWith<BSONObj> status = _getShardKey(txn, chunkMgr, query);
         if (!status.isOK()) {
@@ -170,12 +208,19 @@ public:
         }
 
         BSONObj shardKey = status.getValue();
-        shared_ptr<Chunk> chunk = chunkMgr->findIntersectingChunk(txn, shardKey);
+        auto chunkStatus = chunkMgr->findIntersectingChunk(txn, shardKey, collation);
+        if (!chunkStatus.isOK()) {
+            uasserted(ErrorCodes::ShardKeyNotFound,
+                      "findAndModify must target a single shard, but was not able to due to "
+                      "non-simple collation");
+        }
 
-        bool ok = _runCommand(txn, conf, chunkMgr, chunk->getShardId(), nss, cmdObj, result);
+        const auto& chunk = chunkStatus.getValue();
+
+        const bool ok = _runCommand(txn, conf, chunkMgr, chunk->getShardId(), nss, cmdObj, result);
         if (ok) {
-            // check whether split is necessary (using update object for size heuristic)
-            chunk->splitIfShould(txn, cmdObj.getObjectField("update").objsize());
+            updateChunkWriteStatsAndSplitIfNeeded(
+                txn, chunkMgr.get(), chunk.get(), cmdObj.getObjectField("update").objsize());
         }
 
         return ok;
@@ -221,7 +266,8 @@ private:
                      BSONObjBuilder& result) const {
         BSONObj res;
 
-        const auto shard = Grid::get(txn)->shardRegistry()->getShard(txn, shardId);
+        const auto shard = uassertStatusOK(Grid::get(txn)->shardRegistry()->getShard(txn, shardId));
+
         ShardConnection conn(shard->getConnString(), nss.ns(), chunkManager);
         bool ok = conn->runCommand(conf->name(), cmdObj, res);
         conn.done();

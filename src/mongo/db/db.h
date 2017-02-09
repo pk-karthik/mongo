@@ -41,6 +41,4 @@ namespace repl {
 class ReplSettings;
 }  // namespace repl
 
-extern void (*snmpInit)();
-
 }  // namespace mongo

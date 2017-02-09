@@ -120,12 +120,14 @@ public:
     /**
      * Starts asynchronous execution of the command described by "request".
      *
+     * The request mutated to append request metadata to be sent in OP_Command messages.
+     *
      * Returns ErrorCodes::ShutdownInProgress if NetworkInterface::shutdown has already started
      * and Status::OK() otherwise. If it returns Status::OK(), then the onFinish argument will be
      * executed by NetworkInterface eventually; otherwise, it will not.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                const RemoteCommandRequest& request,
+                                RemoteCommandRequest& request,
                                 const RemoteCommandCompletionFn& onFinish) = 0;
 
     /**
@@ -133,11 +135,6 @@ public:
      * completed.
      */
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) = 0;
-
-    /**
-     * Requests cancelation of incomplete network activity.
-     */
-    virtual void cancelAllCommands() = 0;
 
     /**
      * Sets an alarm, which schedules "action" to run no sooner than "when".

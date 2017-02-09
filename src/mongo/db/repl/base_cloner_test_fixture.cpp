@@ -50,6 +50,11 @@ const BSONObj BaseClonerTest::idIndexSpec = BSON("v" << 1 << "key" << BSON("_id"
                                                      << nss.ns());
 
 // static
+BSONObj BaseClonerTest::createCountResponse(int documentCount) {
+    return BSON("n" << documentCount << "ok" << 1);
+}
+
+// static
 BSONObj BaseClonerTest::createCursorResponse(CursorId cursorId,
                                              const std::string& ns,
                                              const BSONArray& docs,
@@ -98,15 +103,22 @@ BaseClonerTest::BaseClonerTest()
     : _mutex(), _setStatusCondition(), _status(getDetectableErrorStatus()) {}
 
 void BaseClonerTest::setUp() {
-    ReplicationExecutorTest::setUp();
+    executor::ThreadPoolExecutorTest::setUp();
     clear();
     launchExecutorThread();
+    dbWorkThreadPool = stdx::make_unique<OldThreadPool>(1);
     storageInterface.reset(new StorageInterfaceMock());
 }
 
 void BaseClonerTest::tearDown() {
-    ReplicationExecutorTest::tearDown();
+    executor::ThreadPoolExecutorTest::shutdownExecutorThread();
+    executor::ThreadPoolExecutorTest::joinExecutorThread();
+
     storageInterface.reset();
+    dbWorkThreadPool->join();
+    dbWorkThreadPool.reset();
+
+    executor::ThreadPoolExecutorTest::tearDown();
 }
 
 void BaseClonerTest::clear() {
@@ -128,7 +140,7 @@ void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi, const
     auto net = getNet();
     Milliseconds millis(0);
     RemoteCommandResponse response(obj, BSONObj(), millis);
-    ReplicationExecutor::ResponseStatus responseStatus(response);
+    executor::TaskExecutor::ResponseStatus responseStatus(response);
     log() << "Scheduling response to request:" << noi->getDiagnosticString() << " -- resp:" << obj;
     net->scheduleResponse(noi, net->now(), responseStatus);
 }
@@ -137,9 +149,9 @@ void BaseClonerTest::scheduleNetworkResponse(NetworkOperationIterator noi,
                                              ErrorCodes::Error code,
                                              const std::string& reason) {
     auto net = getNet();
-    ReplicationExecutor::ResponseStatus responseStatus(code, reason);
+    executor::TaskExecutor::ResponseStatus responseStatus(code, reason);
     log() << "Scheduling error response to request:" << noi->getDiagnosticString()
-          << " -- status:" << responseStatus.getStatus().toString();
+          << " -- status:" << responseStatus.status.toString();
     net->scheduleResponse(noi, net->now(), responseStatus);
 }
 
@@ -183,56 +195,61 @@ void BaseClonerTest::testLifeCycle() {
 
     // IsActiveAfterStart
     ASSERT_FALSE(getCloner()->isActive());
-    ASSERT_OK(getCloner()->start());
+    ASSERT_OK(getCloner()->startup());
     ASSERT_TRUE(getCloner()->isActive());
     tearDown();
 
     // StartWhenActive
     setUp();
-    ASSERT_OK(getCloner()->start());
+    ASSERT_OK(getCloner()->startup());
     ASSERT_TRUE(getCloner()->isActive());
-    ASSERT_NOT_OK(getCloner()->start());
+    ASSERT_NOT_OK(getCloner()->startup());
     ASSERT_TRUE(getCloner()->isActive());
     tearDown();
 
     // CancelWithoutStart
     setUp();
     ASSERT_FALSE(getCloner()->isActive());
-    getCloner()->cancel();
+    getCloner()->shutdown();
     ASSERT_FALSE(getCloner()->isActive());
     tearDown();
 
     // WaitWithoutStart
     setUp();
     ASSERT_FALSE(getCloner()->isActive());
-    getCloner()->wait();
+    getCloner()->join();
     ASSERT_FALSE(getCloner()->isActive());
     tearDown();
 
     // ShutdownBeforeStart
     setUp();
     getExecutor().shutdown();
-    ASSERT_NOT_OK(getCloner()->start());
+    ASSERT_NOT_OK(getCloner()->startup());
     ASSERT_FALSE(getCloner()->isActive());
     tearDown();
 
     // StartAndCancel
     setUp();
-    ASSERT_OK(getCloner()->start());
-    scheduleNetworkResponse(BSON("ok" << 1));
-    getCloner()->cancel();
-    finishProcessingNetworkResponse();
+    ASSERT_OK(getCloner()->startup());
+    getCloner()->shutdown();
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        finishProcessingNetworkResponse();
+    }
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
     ASSERT_FALSE(getCloner()->isActive());
     tearDown();
 
     // StartButShutdown
     setUp();
-    ASSERT_OK(getCloner()->start());
-    scheduleNetworkResponse(BSON("ok" << 1));
-    getExecutor().shutdown();
-    // Network interface should not deliver mock response to callback.
-    finishProcessingNetworkResponse();
+    ASSERT_OK(getCloner()->startup());
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(getNet());
+        scheduleNetworkResponse(BSON("ok" << 1));
+        // Network interface should not deliver mock response to callback.
+        getExecutor().shutdown();
+        finishProcessingNetworkResponse();
+    }
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, getStatus().code());
     ASSERT_FALSE(getCloner()->isActive());
 }

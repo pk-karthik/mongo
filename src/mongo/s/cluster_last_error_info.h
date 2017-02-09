@@ -29,7 +29,7 @@
 
 #include <set>
 
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 
 namespace mongo {
@@ -40,7 +40,7 @@ namespace mongo {
  */
 class ClusterLastErrorInfo {
 public:
-    static const ClientBasic::Decoration<ClusterLastErrorInfo> get;
+    static const Client::Decoration<ClusterLastErrorInfo> get;
 
     /** new request not associated (yet or ever) with a client */
     void newRequest();
@@ -69,13 +69,6 @@ public:
      */
     const HostOpTimeMap& getPrevHostOpTimes() const {
         return _prev->hostOpTimes;
-    }
-
-    /**
-     * resets the information stored for the current request
-     */
-    void clearRequestInfo() {
-        _cur->clear();
     }
 
     void disableForCommand();

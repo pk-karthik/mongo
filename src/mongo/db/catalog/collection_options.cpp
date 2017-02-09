@@ -86,6 +86,13 @@ Status checkStorageEngineOptions(const BSONElement& elem) {
     return Status::OK();
 }
 
+// These are collection creation options which are handled elsewhere. If we encounter a field which
+// CollectionOptions doesn't know about, parsing the options should fail unless we find the field
+// name in this whitelist.
+const std::set<StringData> collectionOptionsWhitelist{
+    "maxTimeMS"_sd, "writeConcern"_sd,
+};
+
 }  // namespace
 
 void CollectionOptions::reset() {
@@ -125,9 +132,21 @@ Status CollectionOptions::validate() const {
 Status CollectionOptions::parse(const BSONObj& options) {
     reset();
 
+    // Versions 2.4 and earlier of the server store "create" inside the collection metadata when the
+    // user issues an explicit collection creation command. These versions also wrote any
+    // unrecognized fields into the catalog metadata and allowed the order of these fields to be
+    // changed. Therefore, if the "create" field is present, we must ignore any
+    // unknown fields during parsing. Otherwise, we disallow unknown collection options.
+    //
+    // Versions 2.6 through 3.2 ignored unknown collection options rather than failing but did not
+    // store the "create" field. These versions also refrained from materializing the unknown
+    // options in the catalog, so we are free to fail on unknown options in this case.
+    const bool createdOn24OrEarlier = static_cast<bool>(options["create"]);
+
     // During parsing, ignore some validation errors in order to accept options objects that
     // were valid in previous versions of the server.  SERVER-13737.
     BSONObjIterator i(options);
+
     while (i.more()) {
         BSONElement e = i.next();
         StringData fieldName = e.fieldName();
@@ -142,6 +161,10 @@ Status CollectionOptions::parse(const BSONObj& options) {
             cappedSize = e.numberLong();
             if (cappedSize < 0)
                 return Status(ErrorCodes::BadValue, "size has to be >= 0");
+            const long long kGB = 1024 * 1024 * 1024;
+            const long long kPB = 1024 * 1024 * kGB;
+            if (cappedSize > kPB)
+                return Status(ErrorCodes::BadValue, "size cannot exceed 1 PB");
             cappedSize += 0xff;
             cappedSize &= 0xffffffffffffff00LL;
         } else if (fieldName == "max") {
@@ -241,6 +264,12 @@ Status CollectionOptions::parse(const BSONObj& options) {
             }
 
             pipeline = e.Obj().getOwned();
+        } else if (!createdOn24OrEarlier &&
+                   collectionOptionsWhitelist.find(fieldName) == collectionOptionsWhitelist.end()) {
+            return Status(ErrorCodes::InvalidOptions,
+                          str::stream() << "The field '" << fieldName
+                                        << "' is not a valid collection option. Options: "
+                                        << options);
         }
     }
 

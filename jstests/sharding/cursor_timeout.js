@@ -11,12 +11,39 @@
 (function() {
     'use strict';
 
+    // Cursor timeout on mongod is handled by a single thread/timer that will sleep for
+    // "clientCursorMonitorFrequencySecs" and add the sleep value to each operation's duration when
+    // it wakes up, timing out those whose "now() - last accessed since" time exceeds. A cursor
+    // timeout of 2 seconds with a monitor frequency of 1 second means an effective timeout period
+    // of 1 to 2 seconds.
+    const mongodCursorTimeoutMs = 2000;
+
+    // Cursor timeout on mongos is handled by checking whether the "last accessed" cursor time stamp
+    // is older than "now() - cursorTimeoutMillis" and is checked every
+    // "clientCursorMonitorFrequencySecs" by a global thread/timer. A timeout of 1 second with a
+    // monitor frequency of 1 second means an effective timeout period of 1 to 2 seconds.
+    const mongosCursorTimeoutMs = 1000;
+
+    const cursorMonitorFrequencySecs = 1;
+
     var st = new ShardingTest({
         shards: 2,
         other: {
             chunkSize: 1,
-            shardOptions: {setParameter: "cursorTimeoutMillis=1000"},
-            mongosOptions: {setParameter: "cursorTimeoutMillis=1000"}
+            shardOptions: {
+                verbose: 1,
+                setParameter: {
+                    cursorTimeoutMillis: mongodCursorTimeoutMs,
+                    clientCursorMonitorFrequencySecs: cursorMonitorFrequencySecs
+                }
+            },
+            mongosOptions: {
+                verbose: 1,
+                setParameter: {
+                    cursorTimeoutMillis: mongosCursorTimeoutMs,
+                    clientCursorMonitorFrequencySecs: cursorMonitorFrequencySecs
+                }
+            }
         }
     });
 
@@ -66,9 +93,20 @@
     cursorWithNoTimeout.next();
 
     // Wait until the idle cursor background job has killed the cursors that do not have the "no
-    // timeout" flag set.  We use the "cursorTimeoutMillis" setParameter above to reduce the amount
-    // of time we need to wait here.
-    sleep(5000);
+    // timeout" flag set.  We use the "cursorTimeoutMillis" and "clientCursorMonitorFrequencySecs"
+    // setParameters above to reduce the amount of time we need to wait here.
+    assert.soon(function() {
+        return coll.getDB().serverStatus().metrics.cursor.timedOut > 0;
+    }, "sharded cursor failed to time out");
+
+    // Wait for the shard to have two open cursors on it (shardedCursorWithNoTimeout and
+    // cursorWithNoTimeout).
+    // We cannot reliably use metrics.cursor.timedOut here, because this will be 2 if
+    // shardedCursorWithTimeout is killed for timing out on the shard, and 1 if
+    // shardedCursorWithTimeout is killed by a killCursors command from the mongos.
+    assert.soon(function() {
+        return shardColl.getDB().serverStatus().metrics.cursor.open.total == 2;
+    }, "cursor failed to time out");
 
     assert.throws(function() {
         shardedCursorWithTimeout.itcount();

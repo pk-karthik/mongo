@@ -35,15 +35,15 @@
 #include "mongo/db/field_ref.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-namespace dps = ::mongo::dotted_path_support;
+using IndexVersion = IndexDescriptor::IndexVersion;
 
-// SortStage checks for this error code in order to informatively error when we try to sort keys
-// with parallel arrays.
-const int BtreeKeyGenerator::ParallelArraysCode = 10088;
+namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
@@ -67,6 +67,21 @@ BtreeKeyGenerator::BtreeKeyGenerator(std::vector<const char*> fieldNames,
     _isIdIndex = fieldNames.size() == 1 && std::string("_id") == fieldNames[0];
 }
 
+std::unique_ptr<BtreeKeyGenerator> BtreeKeyGenerator::make(IndexVersion indexVersion,
+                                                           std::vector<const char*> fieldNames,
+                                                           std::vector<BSONElement> fixed,
+                                                           bool isSparse,
+                                                           const CollatorInterface* collator) {
+    switch (indexVersion) {
+        case IndexVersion::kV0:
+            return stdx::make_unique<BtreeKeyGeneratorV0>(fieldNames, fixed, isSparse);
+        case IndexVersion::kV1:
+        case IndexVersion::kV2:
+            return stdx::make_unique<BtreeKeyGeneratorV1>(fieldNames, fixed, isSparse, collator);
+    }
+    return nullptr;
+}
+
 void BtreeKeyGenerator::getKeys(const BSONObj& obj,
                                 BSONObjSet* keys,
                                 MultikeyPaths* multikeyPaths) const {
@@ -81,7 +96,7 @@ void BtreeKeyGenerator::getKeys(const BSONObj& obj,
 static void assertParallelArrays(const char* first, const char* second) {
     std::stringstream ss;
     ss << "cannot index parallel arrays [" << first << "] [" << second << "]";
-    uasserted(BtreeKeyGenerator::ParallelArraysCode, ss.str());
+    uasserted(ErrorCodes::CannotIndexParallelArrays, ss.str());
 }
 
 BtreeKeyGeneratorV0::BtreeKeyGeneratorV0(std::vector<const char*> fieldNames,
@@ -302,10 +317,18 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
         BSONElement e = obj["_id"];
         if (e.eoo()) {
             keys->insert(_nullKey);
-        } else {
+        } else if (_collator) {
             BSONObjBuilder b;
             CollationIndexKey::collationAwareIndexKeyAppend(e, _collator, &b);
+
+            // Insert a copy so its buffer size fits the object size.
+            keys->insert(b.obj().copy());
+        } else {
+            int size = e.size() + 5 /* bson over head*/ - 3 /* remove _id string */;
+            BSONObjBuilder b(size);
+            b.appendAs(e, "");
             keys->insert(b.obj());
+            invariant(keys->begin()->objsize() == size);
         }
 
         // The {_id: 1} index can never be multikey because the _id field isn't allowed to be an
@@ -405,7 +428,23 @@ void BtreeKeyGeneratorV1::getKeysImplWithArray(
         }
         keys->insert(b.obj());
     } else if (arrElt.embeddedObject().firstElement().eoo()) {
-        // Empty array, so set matching fields to undefined.
+        // We've encountered an empty array.
+        if (multikeyPaths && mayExpandArrayUnembedded) {
+            // Any indexed path which traverses through the empty array must be recorded as an array
+            // component.
+            for (auto i : arrIdxs) {
+                // We need to determine which component of the indexed field causes the index to be
+                // multikey as a result of the empty array. Indexed empty arrays are considered
+                // multikey and may occur mid-path. For instance, the indexed path "a.b.c" has
+                // multikey components {0, 1} given the document {a: [{b: []}, {b: 1}]}.
+                size_t fullPathLength = _pathLengths[i];
+                size_t suffixPathLength = FieldRef{fieldNames[i]}.numParts();
+                invariant(suffixPathLength < fullPathLength);
+                arrComponents[i] = fullPathLength - suffixPathLength - 1;
+            }
+        }
+
+        // For an empty array, set matching fields to undefined.
         _getKeysArrEltFixed(&fieldNames,
                             &fixed,
                             undefinedElt,
@@ -487,7 +526,6 @@ void BtreeKeyGeneratorV1::getKeysImplWithArray(
         }
 
         // Generate a key for each element of the indexed array.
-        size_t nArrObjFields = 0;
         for (const auto arrObjElem : arrObj) {
             _getKeysArrEltFixed(&fieldNames,
                                 &fixed,
@@ -499,16 +537,14 @@ void BtreeKeyGeneratorV1::getKeysImplWithArray(
                                 mayExpandArrayUnembedded,
                                 subPositionalInfo,
                                 multikeyPaths);
-            ++nArrObjFields;
         }
+    }
 
-        if (multikeyPaths && nArrObjFields > 1) {
-            // The 'arrElt' array value contains multiple elements, so we say that it causes the
-            // index to be multikey.
-            for (size_t i = 0; i < arrComponents.size(); ++i) {
-                if (auto arrComponent = arrComponents[i]) {
-                    (*multikeyPaths)[i].insert(*arrComponent);
-                }
+    // Record multikey path components.
+    if (multikeyPaths) {
+        for (size_t i = 0; i < arrComponents.size(); ++i) {
+            if (auto arrComponent = arrComponents[i]) {
+                (*multikeyPaths)[i].insert(*arrComponent);
             }
         }
     }

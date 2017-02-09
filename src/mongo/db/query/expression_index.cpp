@@ -29,6 +29,7 @@
 #include "mongo/db/query/expression_index.h"
 
 #include <iostream>
+#include <unordered_set>
 
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/r2_region_coverer.h"
@@ -94,8 +95,8 @@ void ExpressionMapping::GeoHashsToIntervalsWithParents(
         geoHash.appendHashMin(&builder, "");
         geoHash.appendHashMax(&builder, "");
 
-        oilOut->intervals.push_back(
-            IndexBoundsBuilder::makeRangeInterval(builder.obj(), true, true));
+        oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            builder.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
     }
 }
 
@@ -108,20 +109,17 @@ void ExpressionMapping::cover2d(const R2Region& region,
 }
 
 std::vector<S2CellId> ExpressionMapping::get2dsphereCovering(const S2Region& region) {
-    uassert(28739,
-            "Geo coarsest level must be in range [0,30]",
-            0 <= internalQueryS2GeoCoarsestLevel && internalQueryS2GeoCoarsestLevel <= 30);
-    uassert(28740,
-            "Geo finest level must be in range [0,30]",
-            0 <= internalQueryS2GeoFinestLevel && internalQueryS2GeoFinestLevel <= 30);
-    uassert(28741,
-            "Geo coarsest level must be less than or equal to finest",
-            internalQueryS2GeoCoarsestLevel <= internalQueryS2GeoFinestLevel);
+    auto minLevel = internalQueryS2GeoCoarsestLevel.load();
+    auto maxLevel = internalQueryS2GeoFinestLevel.load();
+
+    uassert(28739, "Geo coarsest level must be in range [0,30]", 0 <= minLevel && minLevel <= 30);
+    uassert(28740, "Geo finest level must be in range [0,30]", 0 <= maxLevel && maxLevel <= 30);
+    uassert(28741, "Geo coarsest level must be less than or equal to finest", minLevel <= maxLevel);
 
     S2RegionCoverer coverer;
-    coverer.set_min_level(internalQueryS2GeoCoarsestLevel);
-    coverer.set_max_level(internalQueryS2GeoFinestLevel);
-    coverer.set_max_cells(internalQueryS2GeoMaxCells);
+    coverer.set_min_level(minLevel);
+    coverer.set_max_level(maxLevel);
+    coverer.set_max_cells(internalQueryS2GeoMaxCells.load());
 
     std::vector<S2CellId> cover;
     coverer.GetCovering(region, &cover);
@@ -151,7 +149,8 @@ void S2CellIdsToIntervalsUnsorted(const std::vector<S2CellId>& intervalSet,
             b.append("start", start);
             b.append("end", end);
             invariant(start <= end);
-            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(b.obj(), true, true));
+            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                b.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
         } else {
             // for backwards compatibility, use strings
             std::string start = interval.toString();
@@ -159,8 +158,8 @@ void S2CellIdsToIntervalsUnsorted(const std::vector<S2CellId>& intervalSet,
             end[start.size() - 1]++;
             b.append("start", start);
             b.append("end", end);
-            oilOut->intervals.push_back(
-                IndexBoundsBuilder::makeRangeInterval(b.obj(), true, false));
+            oilOut->intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                b.obj(), BoundInclusion::kIncludeStartKeyOnly));
         }
     }
 }
@@ -186,7 +185,7 @@ void ExpressionMapping::S2CellIdsToIntervalsWithParents(const std::vector<S2Cell
                                                         const S2IndexingParams& indexParams,
                                                         OrderedIntervalList* oilOut) {
     // There may be duplicates when going up parent cells if two cells share a parent
-    std::unordered_set<S2CellId> exactSet;
+    std::unordered_set<S2CellId> exactSet;  // NOLINT
     for (const S2CellId& interval : intervalSet) {
         S2CellId coveredCell = interval;
         // Look at the cells that cover us.  We want to look at every cell that contains the

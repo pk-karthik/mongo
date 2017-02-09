@@ -113,7 +113,7 @@ public:
         const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
 
         auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
-        authConn.reset(cs.connect(errmsg));
+        authConn.reset(cs.connect(StringData(), errmsg));
         if (!authConn) {
             return false;
         }
@@ -158,7 +158,7 @@ public:
         return false;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         // No auth required
@@ -176,7 +176,15 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const string fromDb = cmdObj.getStringField("fromdb");
+        const auto fromdbElt = cmdObj["fromdb"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'renameCollection' must be of type String",
+                fromdbElt.type() == BSONType::String);
+        const string fromDb = fromdbElt.str();
+        uassert(
+            ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid 'fromdb' name: " << fromDb,
+            NamespaceString::validDBName(fromDb, NamespaceString::DollarInDbNameBehavior::Allow));
 
         string fromHost = cmdObj.getStringField("fromhost");
         if (fromHost.empty()) {
@@ -202,7 +210,7 @@ public:
         }
 
         auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
-        authConn.reset(cs.connect(errmsg));
+        authConn.reset(cs.connect(StringData(), errmsg));
         if (!authConn.get()) {
             return false;
         }

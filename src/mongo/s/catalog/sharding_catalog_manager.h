@@ -29,13 +29,21 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
+class BSONObj;
+class ChunkRange;
 class ConnectionString;
+class NamespaceString;
 class OperationContext;
+class ShardId;
+class ShardType;
+class ChunkType;
 class Status;
 template <typename T>
 class StatusWith;
@@ -59,6 +67,10 @@ class ShardingCatalogManager {
     MONGO_DISALLOW_COPYING(ShardingCatalogManager);
 
 public:
+    static Seconds getAddShardTaskRetryInterval() {
+        return Seconds{30};
+    }
+
     virtual ~ShardingCatalogManager() = default;
 
     /**
@@ -108,6 +120,57 @@ public:
                                        const std::string& zoneName) = 0;
 
     /**
+     * Assigns a range of a sharded collection to a particular shard zone. If range is a prefix of
+     * the shard key, the range will be converted into a new range with full shard key filled
+     * with MinKey values.
+     */
+    virtual Status assignKeyRangeToZone(OperationContext* txn,
+                                        const NamespaceString& ns,
+                                        const ChunkRange& range,
+                                        const std::string& zoneName) = 0;
+
+    /**
+     * Removes a range from a zone.
+     * Note: unlike assignKeyRangeToZone, the given range will never be converted to include the
+     * full shard key.
+     */
+    virtual Status removeKeyRangeFromZone(OperationContext* txn,
+                                          const NamespaceString& ns,
+                                          const ChunkRange& range) = 0;
+
+    /**
+     * Updates metadata in config.chunks collection to show the given chunk as split
+     * into smaller chunks at the specified split points.
+     */
+    virtual Status commitChunkSplit(OperationContext* txn,
+                                    const NamespaceString& ns,
+                                    const OID& requestEpoch,
+                                    const ChunkRange& range,
+                                    const std::vector<BSONObj>& splitPoints,
+                                    const std::string& shardName) = 0;
+
+    /**
+     * Updates metadata in config.chunks collection so the chunks with given boundaries are seen
+     * merged into a single larger chunk.
+     */
+    virtual Status commitChunkMerge(OperationContext* txn,
+                                    const NamespaceString& ns,
+                                    const OID& requestEpoch,
+                                    const std::vector<BSONObj>& chunkBoundaries,
+                                    const std::string& shardName) = 0;
+
+    /**
+     * Updates metadata in config.chunks collection to show the given chunk in its new shard.
+     */
+    virtual StatusWith<BSONObj> commitChunkMigration(OperationContext* txn,
+                                                     const NamespaceString& nss,
+                                                     const ChunkType& migratedChunk,
+                                                     const boost::optional<ChunkType>& controlChunk,
+                                                     const OID& collectionEpoch,
+                                                     const ShardId& fromShard,
+                                                     const ShardId& toShard) = 0;
+
+    /**
      * Append information about the connection pools owned by the CatalogManager.
      */
     virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) = 0;
@@ -117,6 +180,29 @@ public:
      * necessary indexes and populating the config.version document.
      */
     virtual Status initializeConfigDatabaseIfNeeded(OperationContext* txn) = 0;
+
+    /**
+     * Called if the config.version document is rolled back.  Indicates to the
+     * ShardingCatalogManager that on the next transition to primary
+     * initializeConfigDatabaseIfNeeded will need to re-run the work to initialize the config
+     * database.
+     */
+    virtual void discardCachedConfigDatabaseInitializationState() = 0;
+
+    /**
+     * Returns a BSON representation of an update request that can be used to insert a
+     * shardIdentity doc into the shard for the given shardType (or update the shard's existing
+     * shardIdentity doc's configsvrConnString if the _id, shardName, and clusterId do not
+     * conflict).
+     */
+    virtual BSONObj createShardIdentityUpsertForAddShard(OperationContext* txn,
+                                                         const std::string& shardName) = 0;
+
+    /**
+     * Runs the setFeatureCompatibilityVersion command on all shards.
+     */
+    virtual Status setFeatureCompatibilityVersionOnShards(OperationContext* txn,
+                                                          const std::string& version) = 0;
 
 protected:
     ShardingCatalogManager() = default;

@@ -54,6 +54,8 @@ class TestCase(unittest.TestCase):
         self.fixture = None
         self.return_code = None
 
+        self.is_configured = False
+
     def long_name(self):
         """
         Returns the path to the test, relative to the current working directory.
@@ -82,6 +84,10 @@ class TestCase(unittest.TestCase):
         """
         Stores 'fixture' as an attribute for later use during execution.
         """
+        if self.is_configured:
+            raise RuntimeError("configure can only be called once")
+
+        self.is_configured = True
         self.fixture = fixture
 
     def run_test(self):
@@ -335,6 +341,16 @@ class JSTestCase(TestCase):
 
         global_vars["MongoRunner.dataDir"] = data_dir
         global_vars["MongoRunner.dataPath"] = data_path
+
+        # Don't set the path to the executables when the user didn't specify them via the command
+        # line. The functions in the mongo shell for spawning processes have their own logic for
+        # determining the default path to use.
+        if config.MONGOD_EXECUTABLE is not None:
+            global_vars["MongoRunner.mongodPath"] = config.MONGOD_EXECUTABLE
+        if config.MONGOS_EXECUTABLE is not None:
+            global_vars["MongoRunner.mongosPath"] = config.MONGOS_EXECUTABLE
+        if self.shell_executable is not None:
+            global_vars["MongoRunner.mongoShellPath"] = self.shell_executable
 
         test_data = global_vars.get("TestData", {}).copy()
         test_data["minPort"] = core.network.PortAllocator.min_test_port(fixture.job_num)

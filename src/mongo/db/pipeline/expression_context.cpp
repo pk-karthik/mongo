@@ -33,27 +33,69 @@
 
 namespace mongo {
 
-ExpressionContext::ExpressionContext(OperationContext* opCtx, const AggregationRequest& request)
+using boost::intrusive_ptr;
+
+ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
+                                                        std::vector<BSONObj> pipeline)
+    : ns(std::move(ns)), pipeline(std::move(pipeline)) {}
+
+ExpressionContext::ExpressionContext(OperationContext* opCtx,
+                                     const AggregationRequest& request,
+                                     std::unique_ptr<CollatorInterface> collator,
+                                     StringMap<ResolvedNamespace> resolvedNamespaces)
     : isExplain(request.isExplain()),
       inShard(request.isFromRouter()),
       extSortAllowed(request.shouldAllowDiskUse()),
       bypassDocumentValidation(request.shouldBypassDocumentValidation()),
       ns(request.getNamespaceString()),
       opCtx(opCtx),
-      collation(request.getCollation()) {
-    if (!collation.isEmpty()) {
-        auto statusWithCollator =
-            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation);
-        uassertStatusOK(statusWithCollator.getStatus());
-        collator = std::move(statusWithCollator.getValue());
-    }
-}
+      collation(request.getCollation()),
+      _collator(std::move(collator)),
+      _documentComparator(_collator.get()),
+      _valueComparator(_collator.get()),
+      _resolvedNamespaces(std::move(resolvedNamespaces)) {}
 
 void ExpressionContext::checkForInterrupt() {
     // This check could be expensive, at least in relative terms, so don't check every time.
-    if (--interruptCounter == 0) {
+    if (--_interruptCounter == 0) {
         opCtx->checkForInterrupt();
-        interruptCounter = kInterruptCheckPeriod;
+        _interruptCounter = kInterruptCheckPeriod;
     }
 }
+
+void ExpressionContext::setCollator(std::unique_ptr<CollatorInterface> coll) {
+    _collator = std::move(coll);
+
+    // Document/Value comparisons must be aware of the collation.
+    _documentComparator = DocumentComparator(_collator.get());
+    _valueComparator = ValueComparator(_collator.get());
+}
+
+intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(NamespaceString ns) const {
+    intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext();
+
+    expCtx->isExplain = isExplain;
+    expCtx->inShard = inShard;
+    expCtx->inRouter = inRouter;
+    expCtx->extSortAllowed = extSortAllowed;
+    expCtx->bypassDocumentValidation = bypassDocumentValidation;
+
+    expCtx->ns = std::move(ns);
+    expCtx->tempDir = tempDir;
+
+    expCtx->opCtx = opCtx;
+
+    expCtx->collation = collation;
+    if (_collator) {
+        expCtx->setCollator(_collator->clone());
+    }
+
+    expCtx->_resolvedNamespaces = _resolvedNamespaces;
+
+    // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
+    // intended to be used for executing a separate aggregation pipeline.
+
+    return expCtx;
+}
+
 }  // namespace mongo

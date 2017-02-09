@@ -58,35 +58,39 @@ public:
     virtual ~ReplicationCoordinatorExternalStateMock();
     virtual void startThreads(const ReplSettings& settings) override;
     virtual void startInitialSync(OnInitialSyncFinishedFn finished) override;
-    virtual void startSteadyStateReplication(OperationContext* txn) override;
+    virtual void startSteadyStateReplication(OperationContext* txn,
+                                             ReplicationCoordinator* replCoord) override;
+    virtual void stopDataReplication(OperationContext* txn) override;
     virtual void runOnInitialSyncThread(stdx::function<void(OperationContext* txn)> run) override;
     virtual bool isInitialSyncFlagSet(OperationContext* txn) override;
 
     virtual void startMasterSlave(OperationContext*);
     virtual void shutdown(OperationContext* txn);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
+    virtual OldThreadPool* getDbWorkThreadPool() const override;
+    virtual Status runRepairOnLocalDB(OperationContext* txn) override;
     virtual Status initializeReplSetStorage(OperationContext* txn, const BSONObj& config);
-    virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
+    void onDrainComplete(OperationContext* txn) override;
+    OpTime onTransitionToPrimary(OperationContext* txn, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
-    virtual bool isSelf(const HostAndPort& host, ServiceContext* ctx);
+    virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn);
     virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config);
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* txn);
     virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
-    virtual void setGlobalTimestamp(const Timestamp& newTime);
+    virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
     virtual void cleanUpLastApplyBatch(OperationContext* txn);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void shardingOnStepDownHook();
-    virtual void shardingOnDrainingStateHook(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
     virtual void signalApplierToCancelFetcher();
-    virtual void dropAllTempCollections(OperationContext* txn);
     virtual void dropAllSnapshots();
     virtual void updateCommittedSnapshot(SnapshotName newCommitPoint);
+    virtual void createSnapshot(OperationContext* txn, SnapshotName name);
     virtual void forceSnapshotCreation();
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters();
@@ -95,14 +99,16 @@ public:
     virtual StatusWith<OpTime> multiApply(OperationContext* txn,
                                           MultiApplier::Operations ops,
                                           MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual void multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-    virtual void multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                       const HostAndPort& source) override;
+    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
+    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                         const HostAndPort& source,
+                                         AtomicUInt32* fetchCount) override;
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
         OperationContext* txn) const override;
     virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
         OperationContext* txn) const override;
     virtual bool shouldUseDataReplicatorInitialSync() const override;
+    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"
@@ -173,6 +179,21 @@ public:
      * Sets if we are taking snapshots for read concern majority use.
      */
     void setAreSnapshotsEnabled(bool val);
+
+    /**
+     * Noop
+     */
+    virtual void setupNoopWriter(Seconds waitTime);
+
+    /**
+     * Noop
+     */
+    virtual void startNoopWriter(OpTime lastKnownOpTime);
+
+    /**
+     * Noop
+     */
+    virtual void stopNoopWriter();
 
 private:
     StatusWith<BSONObj> _localRsConfigDocument;

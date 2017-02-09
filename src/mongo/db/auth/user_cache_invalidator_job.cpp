@@ -53,7 +53,7 @@ namespace mongo {
 namespace {
 
 // How often to check with the config servers whether authorization information has changed.
-std::atomic<int> userCacheInvalidationIntervalSecs(30);  // NOLINT 30 second default
+AtomicInt32 userCacheInvalidationIntervalSecs(30);  // 30 second default
 stdx::mutex invalidationIntervalMutex;
 stdx::condition_variable invalidationIntervalChangedCondition;
 Date_t lastInvalidationTime;
@@ -112,7 +112,7 @@ UserCacheInvalidator::UserCacheInvalidator(AuthorizationManager* authzManager)
     : _authzManager(authzManager) {}
 
 UserCacheInvalidator::~UserCacheInvalidator() {
-    invariant(inShutdown());
+    invariant(globalInShutdownDeprecated());
     // Wait to stop running.
     wait();
 }
@@ -153,7 +153,7 @@ void UserCacheInvalidator::run() {
         lastInvalidationTime = now;
         lock.unlock();
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             break;
         }
 
@@ -163,12 +163,11 @@ void UserCacheInvalidator::run() {
             if (currentGeneration.getStatus().code() == ErrorCodes::CommandNotFound) {
                 warning() << "_getUserCacheGeneration command not found on config server(s), "
                              "this most likely means you are running an outdated version of mongod "
-                             "on the config servers"
-                          << std::endl;
+                             "on the config servers";
             } else {
                 warning() << "An error occurred while fetching current user cache generation "
                              "to check if user cache needs invalidation: "
-                          << currentGeneration.getStatus() << std::endl;
+                          << currentGeneration.getStatus();
             }
             // When in doubt, invalidate the cache
             _authzManager->invalidateUserCache();
@@ -177,7 +176,7 @@ void UserCacheInvalidator::run() {
 
         if (currentGeneration.getValue() != _previousCacheGeneration) {
             log() << "User cache generation changed from " << _previousCacheGeneration << " to "
-                  << currentGeneration.getValue() << "; invalidating user cache" << std::endl;
+                  << currentGeneration.getValue() << "; invalidating user cache";
             _authzManager->invalidateUserCache();
             _previousCacheGeneration = currentGeneration.getValue();
         }

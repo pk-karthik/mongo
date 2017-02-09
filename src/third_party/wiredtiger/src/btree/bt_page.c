@@ -67,7 +67,7 @@ __wt_page_alloc(WT_SESSION_IMPL *session,
 
 	switch (type) {
 	case WT_PAGE_COL_FIX:
-		page->pg_fix_entries = alloc_entries;
+		page->entries = alloc_entries;
 		break;
 	case WT_PAGE_COL_INT:
 	case WT_PAGE_ROW_INT:
@@ -102,12 +102,12 @@ err:			if ((pindex = WT_INTL_INDEX_GET_SAFE(page)) != NULL) {
 		}
 		break;
 	case WT_PAGE_COL_VAR:
-		page->pg_var_d = (WT_COL *)((uint8_t *)page + sizeof(WT_PAGE));
-		page->pg_var_entries = alloc_entries;
+		page->pg_var = (WT_COL *)((uint8_t *)page + sizeof(WT_PAGE));
+		page->entries = alloc_entries;
 		break;
 	case WT_PAGE_ROW_LEAF:
-		page->pg_row_d = (WT_ROW *)((uint8_t *)page + sizeof(WT_PAGE));
-		page->pg_row_entries = alloc_entries;
+		page->pg_row = (WT_ROW *)((uint8_t *)page + sizeof(WT_PAGE));
+		page->entries = alloc_entries;
 		break;
 	WT_ILLEGAL_VALUE(session);
 	}
@@ -219,6 +219,7 @@ __wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref,
 
 	/* Update the page's in-memory size and the cache statistics. */
 	__wt_cache_page_inmem_incr(session, page, size);
+	__wt_cache_page_image_incr(session, dsk->mem_size);
 
 	/* Link the new internal page to the parent. */
 	if (ref != NULL) {
@@ -295,7 +296,7 @@ __inmem_col_int(WT_SESSION_IMPL *session, WT_PAGE *page)
  * __inmem_col_var_repeats --
  *	Count the number of repeat entries on the page.
  */
-static int
+static void
 __inmem_col_var_repeats(WT_SESSION_IMPL *session, WT_PAGE *page, uint32_t *np)
 {
 	WT_BTREE *btree;
@@ -315,7 +316,6 @@ __inmem_col_var_repeats(WT_SESSION_IMPL *session, WT_PAGE *page, uint32_t *np)
 		if (__wt_cell_rle(unpack) > 1)
 			++*np;
 	}
-	return (0);
 }
 
 /*
@@ -333,9 +333,10 @@ __inmem_col_var(
 	WT_CELL *cell;
 	WT_CELL_UNPACK *unpack, _unpack;
 	const WT_PAGE_HEADER *dsk;
+	size_t size;
 	uint64_t rle;
-	size_t bytes_allocated;
 	uint32_t i, indx, n, repeat_off;
+	void *p;
 
 	btree = S2BT(session);
 	dsk = page->dsk;
@@ -343,7 +344,6 @@ __inmem_col_var(
 	repeats = NULL;
 	repeat_off = 0;
 	unpack = &_unpack;
-	bytes_allocated = 0;
 
 	/*
 	 * Walk the page, building references: the page contains unsorted value
@@ -351,7 +351,7 @@ __inmem_col_var(
 	 * (WT_CELL_VALUE_OVFL) or deleted items (WT_CELL_DEL).
 	 */
 	indx = 0;
-	cip = page->pg_var_d;
+	cip = page->pg_var;
 	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
 		__wt_cell_unpack(cell, unpack);
 		WT_COL_PTR_SET(cip, WT_PAGE_DISK_OFFSET(page, cell));
@@ -366,14 +366,15 @@ __inmem_col_var(
 		rle = __wt_cell_rle(unpack);
 		if (rle > 1) {
 			if (repeats == NULL) {
-				WT_RET(
-				    __inmem_col_var_repeats(session, page, &n));
-				WT_RET(__wt_realloc_def(session,
-				    &bytes_allocated, n + 1, &repeats));
+				__inmem_col_var_repeats(session, page, &n);
+				size = sizeof(WT_COL_VAR_REPEAT) +
+				    (n + 1) * sizeof(WT_COL_RLE);
+				WT_RET(__wt_calloc(session, 1, size, &p));
+				*sizep += size;
 
-				page->pg_var_repeats = repeats;
+				page->u.col_var.repeats = p;
 				page->pg_var_nrepeats = n;
-				*sizep += bytes_allocated;
+				repeats = page->pg_var_repeats;
 			}
 			repeats[repeat_off].indx = indx;
 			repeats[repeat_off].recno = recno;
@@ -570,7 +571,7 @@ __inmem_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page)
 	unpack = &_unpack;
 
 	/* Walk the page, building indices. */
-	rip = page->pg_row_d;
+	rip = page->pg_row;
 	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
 		__wt_cell_unpack(cell, unpack);
 		switch (unpack->type) {

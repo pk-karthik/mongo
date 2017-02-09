@@ -66,6 +66,8 @@
  *       mongosOptions {Object}: same as the mongos property above.
  *          Can be used to specify options that are common all mongos.
  *       enableBalancer {boolean} : if true, enable the balancer
+ *       enableAutoSplit {boolean} : if true, enable autosplitting; else, default to the
+ * enableBalancer setting
  *       manualAddShard {boolean}: shards will not be added if true.
  *
  *       useBridge {boolean}: If true, then a mongobridge process is started for each node in the
@@ -78,9 +80,7 @@
  *         specify options that are common all replica members.
  *       useHostname {boolean}: if true, use hostname of machine,
  *         otherwise use localhost
- *       numReplicas {number},
- *       waitForCSRSSecondaries {boolean}: if false, will not wait for the read committed view
- *         of the secondaries to catch up with the primary. Defaults to true.
+ *       numReplicas {number}
  *     }
  *   }
  *
@@ -109,6 +109,10 @@ var ShardingTest = function(params) {
     // Populated with the paths of all shard hosts (config servers + hosts) and is used for
     // cleaning up the data files on shutdown
     var _alldbpaths = [];
+
+    // Timeout to be used for operations scheduled by the sharding test, which must wait for write
+    // concern (5 minutes)
+    var kDefaultWTimeoutMs = 5 * 60 * 1000;
 
     // Publicly exposed variables
 
@@ -191,7 +195,7 @@ var ShardingTest = function(params) {
                 db = self.getDB('test');
 
                 try {
-                    sh[fn].apply(sh, arguments);
+                    return sh[fn].apply(sh, arguments);
                 } finally {
                     db = oldDb;
                 }
@@ -203,24 +207,12 @@ var ShardingTest = function(params) {
      * Configures the cluster based on the specified parameters (balancer state, etc).
      */
     function _configureCluster() {
-        // Disable the balancer unless it is explicitly turned on
         if (!otherParams.enableBalancer) {
             self.stopBalancer();
         }
-
-        // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
-        // inaccessible in order to speed up tests, which shutdown entire shards and check for
-        // errors. This attempt is best-effort and failure should not have effect on the actual
-        // test execution, just the execution time.
-        self._mongos.forEach(function(mongos) {
-            var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
-
-            // For tests, which use x509 certificate for authentication, the command above will not
-            // work due to authorization error.
-            if (res.code != ErrorCodes.Unauthorized) {
-                assert.commandWorked(res);
-            }
-        });
+        if (!otherParams.enableAutoSplit) {
+            self.disableAutoSplit();
+        }
     }
 
     function connectionURLTheSame(a, b) {
@@ -584,10 +576,15 @@ var ShardingTest = function(params) {
 
         var initialStatus = getBalancerStatus();
         var currentStatus;
-        assert.soon(function() {
-            currentStatus = getBalancerStatus();
-            return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
-        }, 'Latest balancer status' + currentStatus, timeoutMs);
+        assert.soon(
+            function() {
+                currentStatus = getBalancerStatus();
+                return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
+            },
+            function() {
+                return 'Latest balancer status: ' + tojson(currentStatus);
+            },
+            timeoutMs);
     };
 
     /**
@@ -660,8 +657,6 @@ var ShardingTest = function(params) {
         if (collName.getDB) {
             c = "" + collName;
         }
-
-        var isEmpty = (this.s.getCollection(c).count() == 0);
 
         if (!_isSharded(dbName)) {
             this.s.adminCommand({enableSharding: dbName});
@@ -741,8 +736,10 @@ var ShardingTest = function(params) {
     /**
      * Stops and restarts a mongos process.
      *
-     * If opts is specified, the new mongos is started using those options. Otherwise, it is started
-     * with its previous parameters.
+     * If 'opts' is not specified, starts the mongos with its previous parameters.  If 'opts' is
+     * specified and 'opts.restart' is false or missing, starts mongos with the parameters specified
+     * in 'opts'.  If opts is specified and 'opts.restart' is true, merges the previous options
+     * with the options specified in 'opts', with the options in 'opts' taking precedence.
      *
      * Warning: Overwrites the old s (if n = 0) admin, config, and sn member variables.
      */
@@ -773,6 +770,16 @@ var ShardingTest = function(params) {
             });
 
             this._mongos[n] = new MongoBridge(bridgeOptions);
+        }
+
+        if (opts.restart) {
+            opts = Object.merge(mongos.fullOptions, opts);
+
+            // If the mongos is being restarted with a newer version, make sure we remove any
+            // options that no longer exist in the newer version.
+            if (MongoRunner.areBinVersionsTheSame('latest', opts.binVersion)) {
+                delete opts.noAutoSplit;
+            }
         }
 
         var newConn = MongoRunner.runMongos(opts);
@@ -921,20 +928,107 @@ var ShardingTest = function(params) {
         assert(res.ok || res.errmsg == "it is already the primary", tojson(res));
     };
 
+    /**
+     * Returns whether any settings to ShardingTest or jsTestOptions indicate this is a multiversion
+     * cluster.
+     *
+     * Checks for 'last-stable' bin versions via:
+     *     jsTestOptions().shardMixedBinVersions, jsTestOptions().mongosBinVersion,
+     *     otherParams.configOptions.binVersion, otherParams.shardOptions.binVersion,
+     *     otherParams.mongosOptions.binVersion
+     */
+    function _isMixedVersionCluster() {
+        var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+
+        // Must check shardMixedBinVersion because it causes shardOptions.binVersion to be an object
+        // (versionIterator) rather than a version string. Must check mongosBinVersion, as well,
+        // because it does not update mongosOptions.binVersion.
+        if (jsTestOptions().shardMixedBinVersions ||
+            (jsTestOptions().mongosBinVersion &&
+             MongoRunner.areBinVersionsTheSame(lastStableBinVersion,
+                                               jsTestOptions().mongosBinVersion))) {
+            return true;
+        }
+
+        // Check for 'last-stable' config servers.
+        if (otherParams.configOptions && otherParams.configOptions.binVersion &&
+            MongoRunner.areBinVersionsTheSame(
+                lastStableBinVersion,
+                MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion))) {
+            return true;
+        }
+        for (var i = 0; i < numConfigs; ++i) {
+            if (otherParams['c' + i] && otherParams['c' + i].binVersion &&
+                MongoRunner.areBinVersionsTheSame(
+                    lastStableBinVersion,
+                    MongoRunner.getBinVersionFor(otherParams['c' + i].binVersion))) {
+                return true;
+            }
+        }
+
+        // Check for 'last-stable' mongod servers.
+        if (otherParams.shardOptions && otherParams.shardOptions.binVersion &&
+            MongoRunner.areBinVersionsTheSame(
+                lastStableBinVersion,
+                MongoRunner.getBinVersionFor(otherParams.shardOptions.binVersion))) {
+            return true;
+        }
+        for (var i = 0; i < numShards; ++i) {
+            if (otherParams['d' + i] && otherParams['d' + i].binVersion &&
+                MongoRunner.areBinVersionsTheSame(
+                    lastStableBinVersion,
+                    MongoRunner.getBinVersionFor(otherParams['d' + i].binVersion))) {
+                return true;
+            }
+        }
+
+        // Check for 'last-stable' mongos servers.
+        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion &&
+            MongoRunner.areBinVersionsTheSame(
+                lastStableBinVersion,
+                MongoRunner.getBinVersionFor(otherParams.mongosOptions.binVersion))) {
+            return true;
+        }
+        for (var i = 0; i < numMongos; ++i) {
+            if (otherParams['s' + i] && otherParams['s' + i].binVersion &&
+                MongoRunner.areBinVersionsTheSame(
+                    lastStableBinVersion,
+                    MongoRunner.getBinVersionFor(otherParams['s' + i].binVersion))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns if there is a new feature compatibility version for the "latest" version. This must
+     * be manually changed if and when there is a new feature compatibility version.
+     */
+    function _hasNewFeatureCompatibilityVersion() {
+        return false;
+    }
+
     // ShardingTest initialization
 
     assert(isObject(params), 'ShardingTest configuration must be a JSON object');
 
-    var testName = params.name || "test";
+    var testName = params.name || jsTest.name();
     var otherParams = Object.merge(params, params.other || {});
 
     var numShards = otherParams.hasOwnProperty('shards') ? otherParams.shards : 2;
-    var verboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
+    var mongosVerboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
     var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
     var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
-    var waitForCSRSSecondaries = otherParams.hasOwnProperty('waitForCSRSSecondaries')
-        ? otherParams.waitForCSRSSecondaries
-        : true;
+
+    // Default enableBalancer to false.
+    otherParams.enableBalancer =
+        ("enableBalancer" in otherParams) && (otherParams.enableBalancer === true);
+
+    // Let autosplit behavior match that of the balancer if autosplit is not explicitly set.
+    if (!("enableAutoSplit" in otherParams)) {
+        otherParams.enableAutoSplit = otherParams.enableBalancer;
+    }
 
     // Allow specifying mixed-type options like this:
     // { mongos : [ { noprealloc : "" } ],
@@ -992,6 +1086,11 @@ var ShardingTest = function(params) {
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
 
+    if (jsTestOptions().networkMessageCompressors) {
+        otherParams.bridgeOptions["networkMessageCompressors"] =
+            jsTestOptions().networkMessageCompressors;
+    }
+
     var keyFile = otherParams.keyFile;
     var hostName = getHostName();
 
@@ -1026,7 +1125,7 @@ var ShardingTest = function(params) {
                 noJournalPrealloc: otherParams.nopreallocj,
                 oplogSize: 16,
                 shardsvr: '',
-                pathOpts: Object.merge(pathOpts, {shard: i})
+                pathOpts: Object.merge(pathOpts, {shard: i}),
             };
 
             rsDefaults = Object.merge(rsDefaults, otherParams.rs);
@@ -1078,6 +1177,20 @@ var ShardingTest = function(params) {
                 shardsvr: '',
                 keyFile: keyFile
             };
+
+            if (jsTestOptions().shardMixedBinVersions) {
+                if (!otherParams.shardOptions) {
+                    otherParams.shardOptions = {};
+                }
+                // If the test doesn't depend on specific shard binVersions, create a mixed version
+                // shard cluster that randomly assigns shard binVersions, half "latest" and half
+                // "last-stable".
+                if (!otherParams.shardOptions.binVersion) {
+                    Random.setRandomSeed();
+                    otherParams.shardOptions.binVersion =
+                        MongoRunner.versionIterator(["latest", "last-stable"], true);
+                }
+            }
 
             if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
                 otherParams.shardOptions.binVersion =
@@ -1198,13 +1311,66 @@ var ShardingTest = function(params) {
     // Wait for master to be elected before starting mongos
     var csrsPrimary = this.configRS.getPrimary();
 
+    // If 'otherParams.mongosOptions.binVersion' is an array value, then we'll end up constructing a
+    // version iterator. We initialize the options for the mongos processes before checking whether
+    // we need to run {setFeatureCompatibilityVersion: "3.2"} on the CSRS primary so we know
+    // definitively what binVersions will be used for the mongos processes.
+    const mongosOptions = [];
+    for (var i = 0; i < numMongos; ++i) {
+        let options = {
+            useHostname: otherParams.useHostname,
+            pathOpts: Object.merge(pathOpts, {mongos: i}),
+            verbose: mongosVerboseLevel,
+            keyFile: keyFile,
+        };
+
+        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
+            otherParams.mongosOptions.binVersion =
+                MongoRunner.versionIterator(otherParams.mongosOptions.binVersion);
+        }
+
+        options = Object.merge(options, otherParams.mongosOptions);
+        options = Object.merge(options, otherParams["s" + i]);
+
+        options.port = options.port || allocatePort();
+
+        // TODO(esha): remove after v3.4 ships.
+        // Legacy mongoses use a command line option to disable autosplit instead of reading the
+        // config.settings collection.
+        if (options.binVersion && MongoRunner.areBinVersionsTheSame('3.2', options.binVersion) &&
+            !otherParams.enableAutoSplit) {
+            options.noAutoSplit = "";
+        }
+
+        mongosOptions.push(options);
+    }
+
+    const configRS = this.configRS;
+    if (_hasNewFeatureCompatibilityVersion && _isMixedVersionCluster()) {
+        function setFeatureCompatibilityVersion() {
+            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.4'}));
+
+            // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
+            // to ensure that older versions of mongos can successfully connect.
+            configRS.awaitReplication();
+        }
+
+        if (keyFile) {
+            authutil.asCluster(this.configRS.nodes, keyFile, setFeatureCompatibilityVersion);
+        } else {
+            setFeatureCompatibilityVersion();
+        }
+    }
+
     // If chunkSize has been requested for this test, write the configuration
     if (otherParams.chunkSize) {
         function setChunkSize() {
             assert.writeOK(csrsPrimary.getDB('config').settings.update(
                 {_id: 'chunksize'},
                 {$set: {value: otherParams.chunkSize}},
-                {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+                {upsert: true, writeConcern: {w: 'majority', wtimeout: kDefaultWTimeoutMs}}));
+
+            configRS.awaitLastOpCommitted();
         }
 
         if (keyFile) {
@@ -1233,23 +1399,8 @@ var ShardingTest = function(params) {
 
     // Start the MongoS servers
     for (var i = 0; i < numMongos; i++) {
-        options = {
-            useHostname: otherParams.useHostname,
-            pathOpts: Object.merge(pathOpts, {mongos: i}),
-            configdb: this._configDB,
-            verbose: verboseLevel || 0,
-            keyFile: keyFile,
-        };
-
-        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
-            otherParams.mongosOptions.binVersion =
-                MongoRunner.versionIterator(otherParams.mongosOptions.binVersion);
-        }
-
-        options = Object.merge(options, otherParams.mongosOptions);
-        options = Object.merge(options, otherParams["s" + i]);
-
-        options.port = options.port || allocatePort();
+        const options = mongosOptions[i];
+        options.configdb = this._configDB;
 
         if (otherParams.useBridge) {
             var bridgeOptions =
@@ -1298,21 +1449,16 @@ var ShardingTest = function(params) {
 
     try {
         if (!otherParams.manualAddShard) {
-            this._shardNames = [];
-
             var testName = this._testName;
             var admin = this.admin;
-            var shardNames = this._shardNames;
 
             this._connections.forEach(function(z) {
                 var n = z.name || z.host || z;
 
                 print("ShardingTest " + testName + " going to add shard : " + n);
 
-                var result = admin.runCommand({addshard: n});
-                assert.commandWorked(result, "Failed to add shard " + n);
-
-                shardNames.push(result.shardAdded);
+                var result = assert.commandWorked(admin.runCommand({addshard: n}),
+                                                  "Failed to add shard " + n);
                 z.shardName = result.shardAdded;
             });
         }
@@ -1323,14 +1469,12 @@ var ShardingTest = function(params) {
         throw e;
     }
 
-    if (waitForCSRSSecondaries) {
-        // Ensure that all CSRS nodes are up to date. This is strictly needed for tests that use
-        // multiple mongoses. In those cases, the first mongos initializes the contents of the
-        // 'config' database, but without waiting for those writes to replicate to all the
-        // config servers then the secondary mongoses risk reading from a stale config server
-        // and seeing an empty config database.
-        this.configRS.awaitLastOpCommitted();
-    }
+    // Ensure that all CSRS nodes are up to date. This is strictly needed for tests that use
+    // multiple mongoses. In those cases, the first mongos initializes the contents of the 'config'
+    // database, but without waiting for those writes to replicate to all the config servers then
+    // the secondary mongoses risk reading from a stale config server and seeing an empty config
+    // database.
+    this.configRS.awaitLastOpCommitted();
 
     if (jsTestOptions().keyFile) {
         jsTest.authenticate(configConnection);

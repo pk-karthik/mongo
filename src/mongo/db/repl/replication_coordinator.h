@@ -57,9 +57,9 @@ struct ConnectionPoolStats;
 
 namespace rpc {
 
+class OplogQueryMetadata;
 class ReplSetMetadata;
 class RequestInterface;
-class ReplSetMetadata;
 
 }  // namespace rpc
 
@@ -275,10 +275,12 @@ public:
                                          bool slaveOk) = 0;
 
     /**
-     * Returns true if this node should ignore unique index constraints on new documents.
-     * Currently this is needed for nodes in STARTUP2, RECOVERING, and ROLLBACK states.
+     * Returns true if this node should ignore index constraints for idempotency reasons.
+     *
+     * The namespace "ns" is passed in because the "local" database is usually writable
+     * and we need to enforce the constraints for it.
      */
-    virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx) = 0;
+    virtual bool shouldRelaxIndexConstraints(const NamespaceString& ns) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime applied for the given slave
@@ -399,6 +401,12 @@ public:
     virtual bool isWaitingForApplierToDrain() = 0;
 
     /**
+     * A new primary tries to have its oplog catch up after winning an election.
+     * Return true if the coordinator is waiting for catch-up to finish.
+     */
+    virtual bool isCatchingUp() = 0;
+
+    /**
      * Signals that a previously requested pause and drain of the applier buffer
      * has completed.
      *
@@ -434,10 +442,19 @@ public:
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const = 0;
 
+    enum class ReplSetGetStatusResponseStyle { kBasic, kInitialSync };
+
     /**
-     * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
+     * Handles an incoming replSetGetStatus command. Adds BSON to 'result'. If kInitialSync is
+     * requested but initial sync is not running, kBasic will be used.
      */
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result) = 0;
+    virtual Status processReplSetGetStatus(BSONObjBuilder* result,
+                                           ReplSetGetStatusResponseStyle responseStyle) = 0;
+
+    /**
+     * Does an initial sync of data, after dropping existing data.
+     */
+    virtual Status resyncData(OperationContext* txn, bool waitUntilCompleted) = 0;
 
     /**
      * Handles an incoming isMaster command for a replica set node.  Should not be
@@ -462,14 +479,13 @@ public:
     virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
 
     /**
-     * Processes the ReplSetMetadata returned from a command run against another replica set
-     * member and updates protocol version 1 information (most recent optime that is committed,
-     * member id of the current PRIMARY, the current config version and the current term).
-     *
-     * TODO(dannenberg): Move this method to be testing only if it does not end up being used
-     * to process the find and getmore metadata responses from the DataReplicator.
+     * Processes the ReplSetMetadata returned from a command run against another
+     * replica set member and so long as the config version in the metadata matches the replica set
+     * config version this node currently has, updates the current term and optionally updates
+     * this node's notion of the commit point.
      */
-    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata,
+                                        bool advanceCommitPoint) = 0;
 
     /**
      * Elections under protocol version 1 are triggered by a timer.
@@ -498,7 +514,9 @@ public:
      * returns Status::OK if the sync target could be set and an ErrorCode indicating why it
      * couldn't otherwise.
      */
-    virtual Status processReplSetSyncFrom(const HostAndPort& target, BSONObjBuilder* resultObj) = 0;
+    virtual Status processReplSetSyncFrom(OperationContext* txn,
+                                          const HostAndPort& target,
+                                          BSONObjBuilder* resultObj) = 0;
 
     /**
      * Handles an incoming replSetFreeze command. Adds BSON to 'resultObj'
@@ -671,9 +689,11 @@ public:
                                               ReplSetRequestVotesResponse* response) = 0;
 
     /**
-     * Prepares a metadata object describing the current term, primary, and lastOp information.
+     * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
+     * on what has been requested.
      */
-    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
+                                     const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
     /**
@@ -732,9 +752,12 @@ public:
     virtual void forceSnapshotCreation() = 0;
 
     /**
-     * Called when a new snapshot is created.
+     * Creates a new snapshot in the storage engine and registers it for use in the replication
+     * coordinator.
      */
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) = 0;
+    virtual void createSnapshot(OperationContext* txn,
+                                OpTime timeOfSnapshot,
+                                SnapshotName name) = 0;
 
     /**
      * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
@@ -772,14 +795,12 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
-
-    virtual bool getInitialSyncRequestedFlag() const = 0;
-    virtual void setInitialSyncRequestedFlag(bool value) = 0;
-
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
     virtual Status stepUpIfEligible() = 0;
+
+    virtual ServiceContext* getServiceContext() = 0;
 
 protected:
     ReplicationCoordinator();

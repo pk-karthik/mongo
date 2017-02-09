@@ -40,7 +40,7 @@ class ShardLocal : public Shard {
     MONGO_DISALLOW_COPYING(ShardLocal);
 
 public:
-    explicit ShardLocal(const ShardId& id) : Shard(id) {}
+    explicit ShardLocal(const ShardId& id);
 
     ~ShardLocal() = default;
 
@@ -64,10 +64,11 @@ public:
                                bool unique) override;
 
 private:
-    StatusWith<Shard::CommandResponse> _runCommand(OperationContext* txn,
-                                                   const ReadPreferenceSetting& unused,
-                                                   const std::string& dbName,
-                                                   const BSONObj& cmdObj) final;
+    Shard::HostWithResponse _runCommand(OperationContext* txn,
+                                        const ReadPreferenceSetting& unused,
+                                        const std::string& dbName,
+                                        Milliseconds maxTimeMSOverrideUnused,
+                                        const BSONObj& cmdObj) final;
 
     StatusWith<Shard::QueryResponse> _exhaustiveFindOnConfig(
         OperationContext* txn,

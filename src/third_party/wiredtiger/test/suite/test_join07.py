@@ -28,7 +28,7 @@
 
 import os, re, run
 import wiredtiger, wttest, suite_random
-from wtscenario import check_scenarios, multiply_scenarios, number_scenarios
+from wtscenario import make_scenarios
 
 class ParseException(Exception):
     def __init__(self, msg):
@@ -198,35 +198,11 @@ class test_join07(wttest.WiredTigerTestCase):
         ('noextractor', dict(extractor=False))
     ]
 
-    scenarios = number_scenarios(extractscen)
+    scenarios = make_scenarios(extractscen)
 
-    # Return the wiredtiger_open extension argument for a shared library.
-    def extensionArg(self, exts):
-        extfiles = []
-        for ext in exts:
-            (dirname, name, libname) = ext
-            if name != None and name != 'none':
-                testdir = os.path.dirname(__file__)
-                extdir = os.path.join(run.wt_builddir, 'ext', dirname)
-                extfile = os.path.join(
-                    extdir, name, '.libs', 'libwiredtiger_' + libname + '.so')
-                if not os.path.exists(extfile):
-                    self.skipTest('extension "' + extfile + '" not built')
-                if not extfile in extfiles:
-                    extfiles.append(extfile)
-        if len(extfiles) == 0:
-            return ''
-        else:
-            return ',extensions=["' + '","'.join(extfiles) + '"]'
-
-    # Override WiredTigerTestCase, we have extensions.
-    def setUpConnectionOpen(self, dir):
-        extarg = self.extensionArg([('extractors', 'csv', 'csv_extractor')])
-        connarg = 'create,error_prefix="{0}: ",{1}'.format(
-            self.shortid(), extarg)
-        conn = self.wiredtiger_open(dir, connarg)
-        self.pr(`conn`)
-        return conn
+    def conn_extensions(self, extlist):
+        extlist.skip_if_missing = True
+        extlist.extension('extractors', 'csv')
 
     def expect(self, token, expected):
         if token == None or token.kind not in expected:

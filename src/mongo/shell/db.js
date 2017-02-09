@@ -237,6 +237,39 @@ var DB;
     };
 
     /**
+     * Command to create a view based on the specified aggregation pipeline.
+     * Usage: db.createView(name, viewOn, pipeline: [{ $operator: {...}}, ... ])
+     *
+     *  @param name String - name of the new view to create
+     *  @param viewOn String - name of the backing view or collection
+     *  @param pipeline [{ $operator: {...}}, ... ] - the aggregation pipeline that defines the view
+     *  @param options { } - options on the view, e.g., collations
+     */
+    DB.prototype.createView = function(name, viewOn, pipeline, opt) {
+        var options = opt || {};
+
+        var cmd = {create: name};
+
+        if (viewOn == undefined) {
+            throw Error("Must specify a backing view or collection");
+        }
+
+        // Since we allow a single stage pipeline to be specified as an object
+        // in aggregation, we need to account for that here for consistency.
+        if (pipeline != undefined) {
+            if (!Array.isArray(pipeline)) {
+                pipeline = [pipeline];
+            }
+        }
+        options.pipeline = pipeline;
+        options.viewOn = viewOn;
+
+        Object.extend(cmd, options);
+
+        return this._dbCommand(cmd);
+    };
+
+    /**
      * @deprecated use getProfilingStatus
      *  Returns the current profiling level of this database
      *  @return SOMETHING_FIXME or null on error
@@ -371,10 +404,19 @@ var DB;
       * @return Object returned has member ok set to true if operation succeeds, false otherwise.
       * See also: db.clone()
     */
-    DB.prototype.copyDatabase = function(fromdb, todb, fromhost, username, password, mechanism) {
+    DB.prototype.copyDatabase = function(
+        fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
         assert(isString(fromdb) && fromdb.length);
         assert(isString(todb) && todb.length);
         fromhost = fromhost || "";
+        if ((typeof username === "boolean") && (typeof password === "undefined") &&
+            (typeof mechanism === "undefined") && (typeof slaveOk === "undefined")) {
+            slaveOk = username;
+            username = undefined;
+        }
+        if (typeof slaveOk !== "boolean") {
+            slaveOk = false;
+        }
 
         if (!mechanism) {
             mechanism = this._getDefaultAuthenticationMechanism();
@@ -383,13 +425,14 @@ var DB;
 
         // Check for no auth or copying from localhost
         if (!username || !password || fromhost == "") {
-            return this._adminCommand({copydb: 1, fromhost: fromhost, fromdb: fromdb, todb: todb});
+            return this._adminCommand(
+                {copydb: 1, fromhost: fromhost, fromdb: fromdb, todb: todb, slaveOk: slaveOk});
         }
 
         // Use the copyDatabase native helper for SCRAM-SHA-1
         if (mechanism == "SCRAM-SHA-1") {
             return this.getMongo().copyDatabaseWithSCRAM(
-                fromdb, todb, fromhost, username, password);
+                fromdb, todb, fromhost, username, password, slaveOk);
         }
 
         // Fall back to MONGODB-CR
@@ -401,7 +444,8 @@ var DB;
             todb: todb,
             username: username,
             nonce: n.nonce,
-            key: this.__pwHash(n.nonce, username, password)
+            key: this.__pwHash(n.nonce, username, password),
+            slaveOk: slaveOk,
         });
     };
 
@@ -423,6 +467,7 @@ var DB;
         print("\tdb.commandHelp(name) returns the help for the command");
         print("\tdb.copyDatabase(fromdb, todb, fromhost)");
         print("\tdb.createCollection(name, { size : ..., capped : ..., max : ... } )");
+        print("\tdb.createView(name, viewOn, [ { $operator: {...}}, ... ], { viewOptions } )");
         print("\tdb.createUser(userDocument)");
         print("\tdb.currentOp() displays currently executing operations in the db");
         print("\tdb.dropDatabase()");
@@ -464,7 +509,7 @@ var DB;
             "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into { cmdObj : 1 }");
         print("\tdb.serverStatus()");
         print("\tdb.setLogLevel(level,<component>)");
-        print("\tdb.setProfilingLevel(level,<slowms>) 0=off 1=slow 2=all");
+        print("\tdb.setProfilingLevel(level,slowms) 0=off 1=slow 2=all");
         print(
             "\tdb.setWriteConcern( <write concern doc> ) - sets the write concern for writes to the db");
         print(
@@ -501,22 +546,25 @@ var DB;
     };
 
     /**
-     * <p> Set profiling level for your db.  Profiling gathers stats on query performance. </p>
+     * Configures settings for capturing operations inside the system.profile collection and in the
+     * slow query log.
      *
-     * <p>Default is off, and resets to off on a database restart -- so if you want it on,
-     *    turn it on periodically. </p>
+     * The 'level' can be 0, 1, or 2:
+     *  - 0 means that profiling is off and nothing will be written to system.profile.
+     *  - 1 means that profiling is on for operations slower than the currently configured 'slowms'
+     *    threshold (more on 'slowms' below).
+     *  - 2 means that profiling is on for all operations, regardless of whether or not they are
+     *    slower than 'slowms'.
      *
-     *  <p>Levels :</p>
-     *   <ul>
-     *    <li>0=off</li>
-     *    <li>1=log very slow operations; optional argument slowms specifies slowness threshold</li>
-     *    <li>2=log all</li>
-     *  @param {String} level Desired level of profiling
-     *  @param {String} slowms For slow logging, query duration that counts as slow (default 100ms)
-     *  @return SOMETHING_FIXME or null on error
+     * The 'options' parameter, if a number, is interpreted as the 'slowms' value to send to the
+     * server. 'slowms' determines the threshold, in milliseconds, above which slow operations get
+     * profiled at profiling level 1 or logged at logLevel 0.
+     *
+     * If 'options' is not a number, it is expected to be an object containing additional parameters
+     * to get passed to the server. For example, db.setProfilingLevel(2, {foo: "bar"}) will issue
+     * the command {profile: 2, foo: "bar"} to the server.
      */
-    DB.prototype.setProfilingLevel = function(level, slowms) {
-
+    DB.prototype.setProfilingLevel = function(level, options) {
         if (level < 0 || level > 2) {
             var errorText = "input level " + level + " is out of range [0..2]";
             var errorObject = new Error(errorText);
@@ -525,8 +573,11 @@ var DB;
         }
 
         var cmd = {profile: level};
-        if (isNumber(slowms))
-            cmd["slowms"] = slowms;
+        if (isNumber(options)) {
+            cmd.slowms = options;
+        } else {
+            cmd = Object.extend(cmd, options);
+        }
         return assert.commandWorked(this._dbCommand(cmd));
     };
 
@@ -760,7 +811,7 @@ var DB;
             throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
         }
 
-        return new DBCommandCursor(this._mongo, res).toArray().sort(compareOn("name"));
+        return new DBCommandCursor(res._mongo, res).toArray().sort(compareOn("name"));
     };
 
     /**
@@ -1183,7 +1234,7 @@ var DB;
     /////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    var _defaultWriteConcern = {w: 'majority', wtimeout: 60 * 1000};
+    var _defaultWriteConcern = {w: 'majority', wtimeout: 5 * 60 * 1000};
 
     function getUserObjString(userObj) {
         var pwd = userObj.pwd;

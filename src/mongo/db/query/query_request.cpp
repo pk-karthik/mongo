@@ -32,10 +32,12 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -98,6 +100,9 @@ const char kPartialResultsField[] = "allowPartialResults";
 const char kTermField[] = "term";
 const char kOptionsField[] = "options";
 
+// Field names for sorting options.
+const char kNaturalSortField[] = "$natural";
+
 }  // namespace
 
 const char QueryRequest::kFindCommandName[] = "find";
@@ -109,7 +114,7 @@ QueryRequest::QueryRequest(NamespaceString nss) : _nss(std::move(nss)) {}
 StatusWith<unique_ptr<QueryRequest>> QueryRequest::makeFromFindCommand(NamespaceString nss,
                                                                        const BSONObj& cmdObj,
                                                                        bool isExplain) {
-    unique_ptr<QueryRequest> qr(new QueryRequest(std::move(nss)));
+    auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->_explain = isExplain;
 
     // Parse the command BSON by looping through one element at a time.
@@ -585,8 +590,9 @@ Status QueryRequest::validate() const {
 
     if (_tailable) {
         // Tailable cursors cannot have any sort other than {$natural: 1}.
-        const BSONObj expectedSort = BSON("$natural" << 1);
-        if (!_sort.isEmpty() && _sort != expectedSort) {
+        const BSONObj expectedSort = BSON(kNaturalSortField << 1);
+        if (!_sort.isEmpty() &&
+            SimpleBSONObjComparator::kInstance.evaluate(_sort != expectedSort)) {
             return Status(ErrorCodes::BadValue,
                           "cannot use tailable option with a sort other than {$natural: 1}");
         }
@@ -697,9 +703,25 @@ bool QueryRequest::isQueryIsolated(const BSONObj& query) {
 
 // static
 StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryMessage(const QueryMessage& qm) {
-    unique_ptr<QueryRequest> qr(new QueryRequest(NamespaceString(qm.ns)));
+    auto qr = stdx::make_unique<QueryRequest>(NamespaceString(qm.ns));
 
     Status status = qr->init(qm.ntoskip, qm.ntoreturn, qm.queryOptions, qm.query, qm.fields, true);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return std::move(qr);
+}
+
+StatusWith<unique_ptr<QueryRequest>> QueryRequest::fromLegacyQueryForTest(NamespaceString nss,
+                                                                          const BSONObj& queryObj,
+                                                                          const BSONObj& proj,
+                                                                          int ntoskip,
+                                                                          int ntoreturn,
+                                                                          int queryOptions) {
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+
+    Status status = qr->init(ntoskip, ntoreturn, queryOptions, queryObj, proj, true);
     if (!status.isOK()) {
         return status;
     }
@@ -730,6 +752,11 @@ Status QueryRequest::init(int ntoskip,
         } else {
             _ntoreturn = ntoreturn;
         }
+    }
+
+    // An ntoreturn of 1 is special because it also means to return at most one batch.
+    if (_ntoreturn.value_or(0) == 1) {
+        _wantMore = false;
     }
 
     // Initialize flags passed as 'queryOptions' bit vector.
@@ -852,6 +879,13 @@ Status QueryRequest::initFullQuery(const BSONObj& top) {
                     return maxTimeMS.getStatus();
                 }
                 _maxTimeMS = maxTimeMS.getValue();
+            } else if (str::equals("comment", name)) {
+                // Legacy $comment can be any BSON element. Convert to string if it isn't already.
+                if (e.type() == BSONType::String) {
+                    _comment = e.str();
+                } else {
+                    _comment = e.toString(false);
+                }
             }
         }
     }
@@ -910,4 +944,129 @@ boost::optional<long long> QueryRequest::getEffectiveBatchSize() const {
     return _batchSize ? _batchSize : _ntoreturn;
 }
 
+StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
+    BSONObjBuilder aggregationBuilder;
+
+    // First, check if this query has options that are not supported in aggregation.
+    if (!_min.isEmpty()) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kMinField << " not supported in aggregation."};
+    }
+    if (!_max.isEmpty()) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kMaxField << " not supported in aggregation."};
+    }
+    if (_maxScan != 0) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kMaxScanField << " not supported in aggregation."};
+    }
+    if (_returnKey) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kReturnKeyField << " not supported in aggregation."};
+    }
+    if (!_comment.empty()) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kCommentField << " not supported in aggregation."};
+    }
+    if (_showRecordId) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kShowRecordIdField
+                              << " not supported in aggregation."};
+    }
+    if (_snapshot) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kSnapshotField << " not supported in aggregation."};
+    }
+    if (_tailable) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kTailableField << " not supported in aggregation."};
+    }
+    if (_oplogReplay) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kOplogReplayField
+                              << " not supported in aggregation."};
+    }
+    if (_noCursorTimeout) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kNoCursorTimeoutField
+                              << " not supported in aggregation."};
+    }
+    if (_awaitData) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kAwaitDataField << " not supported in aggregation."};
+    }
+    if (_allowPartialResults) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kPartialResultsField
+                              << " not supported in aggregation."};
+    }
+    if (_ntoreturn) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Cannot convert to an aggregation if ntoreturn is set."};
+    }
+    if (_sort[kNaturalSortField]) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Sort option " << kNaturalSortField
+                              << " not supported in aggregation."};
+    }
+    // The aggregation command normally does not support the 'singleBatch' option, but we make a
+    // special exception if 'limit' is set to 1.
+    if (!_wantMore && _limit.value_or(0) != 1LL) {
+        return {ErrorCodes::InvalidPipelineOperator,
+                str::stream() << "Option " << kSingleBatchField
+                              << " not supported in aggregation."};
+    }
+
+    // Now that we've successfully validated this QR, begin building the aggregation command.
+    aggregationBuilder.append("aggregate", _nss.coll());
+
+    // Construct an aggregation pipeline that finds the equivalent documents to this query request.
+    BSONArrayBuilder pipelineBuilder(aggregationBuilder.subarrayStart("pipeline"));
+    if (!_filter.isEmpty()) {
+        BSONObjBuilder matchBuilder(pipelineBuilder.subobjStart());
+        matchBuilder.append("$match", _filter);
+        matchBuilder.doneFast();
+    }
+    if (!_sort.isEmpty()) {
+        BSONObjBuilder sortBuilder(pipelineBuilder.subobjStart());
+        sortBuilder.append("$sort", _sort);
+        sortBuilder.doneFast();
+    }
+    if (_skip) {
+        BSONObjBuilder skipBuilder(pipelineBuilder.subobjStart());
+        skipBuilder.append("$skip", *_skip);
+        skipBuilder.doneFast();
+    }
+    if (_limit) {
+        BSONObjBuilder limitBuilder(pipelineBuilder.subobjStart());
+        limitBuilder.append("$limit", *_limit);
+        limitBuilder.doneFast();
+    }
+    if (!_proj.isEmpty()) {
+        BSONObjBuilder projectBuilder(pipelineBuilder.subobjStart());
+        projectBuilder.append("$project", _proj);
+        projectBuilder.doneFast();
+    }
+    pipelineBuilder.doneFast();
+
+    // The aggregation 'cursor' option is always set, regardless of the presence of batchSize.
+    BSONObjBuilder batchSizeBuilder(aggregationBuilder.subobjStart("cursor"));
+    if (_batchSize) {
+        batchSizeBuilder.append(kBatchSizeField, *_batchSize);
+    }
+    batchSizeBuilder.doneFast();
+
+    // Other options.
+    aggregationBuilder.append("collation", _collation);
+    if (_explain) {
+        aggregationBuilder.append("explain", _explain);
+    }
+    if (_maxTimeMS > 0) {
+        aggregationBuilder.append(cmdOptionMaxTimeMS, _maxTimeMS);
+    }
+    if (!_hint.isEmpty()) {
+        aggregationBuilder.append("hint", _hint);
+    }
+    return StatusWith<BSONObj>(aggregationBuilder.obj());
+}
 }  // namespace mongo

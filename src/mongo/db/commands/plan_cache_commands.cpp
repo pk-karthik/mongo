@@ -43,6 +43,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/util/log.h"
@@ -53,19 +54,6 @@ using std::string;
 using std::unique_ptr;
 using namespace mongo;
 
-/**
- * Utility function to extract error code and message from status
- * and append to BSON results.
- */
-void addStatus(const Status& status, BSONObjBuilder& builder) {
-    builder.append("ok", status.isOK() ? 1.0 : 0.0);
-    if (!status.isOK()) {
-        builder.append("code", status.code());
-    }
-    if (!status.reason().empty()) {
-        builder.append("errmsg", status.reason());
-    }
-}
 
 /**
  * Retrieves a collection's plan cache from the database.
@@ -128,16 +116,9 @@ bool PlanCacheCommand::run(OperationContext* txn,
                            int options,
                            string& errmsg,
                            BSONObjBuilder& result) {
-    string ns = parseNs(dbname, cmdObj);
-
-    Status status = runPlanCacheCommand(txn, ns, cmdObj, &result);
-
-    if (!status.isOK()) {
-        addStatus(status, result);
-        return false;
-    }
-
-    return true;
+    const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+    Status status = runPlanCacheCommand(txn, nss.ns(), cmdObj, &result);
+    return appendCommandStatus(result, status);
 }
 
 
@@ -157,7 +138,7 @@ void PlanCacheCommand::help(stringstream& ss) const {
     ss << helpText;
 }
 
-Status PlanCacheCommand::checkAuthForCommand(ClientBasic* client,
+Status PlanCacheCommand::checkAuthForCommand(Client* client,
                                              const std::string& dbname,
                                              const BSONObj& cmdObj) {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
@@ -246,7 +227,7 @@ Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* txn,
                                                      BSONObj& cmdObj,
                                                      BSONObjBuilder* bob) {
     // This is a read lock. The query cache is owned by the collection.
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForRead ctx(txn, NamespaceString(ns));
 
     PlanCache* planCache;
     Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
@@ -298,7 +279,7 @@ Status PlanCacheClear::runPlanCacheCommand(OperationContext* txn,
                                            BSONObj& cmdObj,
                                            BSONObjBuilder* bob) {
     // This is a read lock. The query cache is owned by the collection.
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForRead ctx(txn, NamespaceString(ns));
 
     PlanCache* planCache;
     Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
@@ -331,7 +312,7 @@ Status PlanCacheClear::clear(OperationContext* txn,
         if (!planCache->contains(*cq)) {
             // Log if asked to clear non-existent query shape.
             LOG(1) << ns << ": query shape doesn't exist in PlanCache - "
-                   << cq->getQueryObj().toString() << "(sort: " << cq->getQueryRequest().getSort()
+                   << redact(cq->getQueryObj()) << "(sort: " << cq->getQueryRequest().getSort()
                    << "; projection: " << cq->getQueryRequest().getProj()
                    << "; collation: " << cq->getQueryRequest().getCollation() << ")";
             return Status::OK();
@@ -342,7 +323,7 @@ Status PlanCacheClear::clear(OperationContext* txn,
             return result;
         }
 
-        LOG(1) << ns << ": removed plan cache entry - " << cq->getQueryObj().toString()
+        LOG(1) << ns << ": removed plan cache entry - " << redact(cq->getQueryObj())
                << "(sort: " << cq->getQueryRequest().getSort()
                << "; projection: " << cq->getQueryRequest().getProj()
                << "; collation: " << cq->getQueryRequest().getCollation() << ")";
@@ -374,7 +355,7 @@ Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* txn,
                                                const std::string& ns,
                                                BSONObj& cmdObj,
                                                BSONObjBuilder* bob) {
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForRead ctx(txn, NamespaceString(ns));
 
     PlanCache* planCache;
     Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);

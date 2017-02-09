@@ -41,6 +41,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
@@ -75,9 +76,10 @@ public:
         ReplSettings replSettings;
         replSettings.setOplogSizeBytes(10 * 1024 * 1024);
         replSettings.setMaster(true);
-        setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
+        setGlobalReplicationCoordinator(
+            new repl::ReplicationCoordinatorMock(_txn.getServiceContext(), replSettings));
 
-        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
+        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserverImpl>());
 
         setOplogCollectionName();
         createOplog(&_txn);
@@ -99,7 +101,8 @@ public:
             deleteAll(cllNS());
             ReplSettings replSettings;
             replSettings.setOplogSizeBytes(10 * 1024 * 1024);
-            setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
+            setGlobalReplicationCoordinator(
+                new repl::ReplicationCoordinatorMock(_txn.getServiceContext(), replSettings));
         } catch (...) {
             FAIL("Exception while cleaning up test");
         }
@@ -130,7 +133,7 @@ protected:
             ::mongo::log() << "expected: " << expected.toString() << ", got: " << got.toString()
                            << endl;
         }
-        ASSERT_EQUALS(expected, got);
+        ASSERT_BSONOBJ_EQ(expected, got);
     }
     BSONObj oneOp() const {
         return _client.findOne(cllNS(), BSONObj());
@@ -155,37 +158,17 @@ protected:
         return count;
     }
     int opCount() {
-        ScopedTransaction transaction(&_txn, MODE_X);
-        Lock::GlobalWrite lk(_txn.lockState());
-        OldClientContext ctx(&_txn, cllNS());
-
-        Database* db = ctx.db();
-        Collection* coll = db->getCollection(cllNS());
-        if (!coll) {
-            WriteUnitOfWork wunit(&_txn);
-            coll = db->createCollection(&_txn, cllNS());
-            wunit.commit();
-        }
-
-        int count = 0;
-        auto cursor = coll->getCursor(&_txn);
-        while (auto record = cursor->next()) {
-            ++count;
-        }
-        return count;
+        return DBDirectClient(&_txn).query(cllNS(), BSONObj())->itcount();
     }
     void applyAllOperations() {
         ScopedTransaction transaction(&_txn, MODE_X);
         Lock::GlobalWrite lk(_txn.lockState());
         vector<BSONObj> ops;
         {
-            OldClientContext ctx(&_txn, cllNS());
-            Database* db = ctx.db();
-            Collection* coll = db->getCollection(cllNS());
-
-            auto cursor = coll->getCursor(&_txn);
-            while (auto record = cursor->next()) {
-                ops.push_back(record->data.releaseToBson().getOwned());
+            DBDirectClient db(&_txn);
+            auto cursor = db.query(cllNS(), BSONObj());
+            while (cursor->more()) {
+                ops.push_back(cursor->nextSafeOwned());
             }
         }
         {

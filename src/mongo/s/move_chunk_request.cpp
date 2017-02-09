@@ -32,17 +32,20 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/logger/redaction.h"
 
 namespace mongo {
 namespace {
 
 const char kMoveChunk[] = "moveChunk";
+const char kEpoch[] = "epoch";
+const char kChunkVersion[] = "chunkVersion";
 const char kConfigServerConnectionString[] = "configdb";
 const char kFromShardId[] = "fromShard";
 const char kToShardId[] = "toShard";
 const char kMaxChunkSizeBytes[] = "maxChunkSizeBytes";
 const char kWaitForDelete[] = "waitForDelete";
-const char kTakeDistLock[] = "takeDistLock";
+const char kTakeDistLock[] = "takeDistLock";  // TODO: delete in 3.8
 
 }  // namespace
 
@@ -104,6 +107,14 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
     }
 
     {
+        BSONElement epochElem;
+        Status status = bsonExtractTypedField(obj, kEpoch, BSONType::jstOID, &epochElem);
+        if (!status.isOK())
+            return status;
+        request._versionEpoch = epochElem.OID();
+    }
+
+    {
         Status status =
             bsonExtractBooleanFieldWithDefault(obj, kWaitForDelete, false, &request._waitForDelete);
         if (!status.isOK()) {
@@ -121,11 +132,13 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
         request._maxChunkSizeBytes = static_cast<int64_t>(maxChunkSizeBytes);
     }
 
-    {
-        Status status =
-            bsonExtractBooleanFieldWithDefault(obj, kTakeDistLock, true, &request._takeDistLock);
-        if (!status.isOK()) {
-            return status;
+    {  // TODO: delete this block in 3.8
+        bool takeDistLock = false;
+        Status status = bsonExtractBooleanField(obj, kTakeDistLock, &takeDistLock);
+        if (status.isOK() && takeDistLock) {
+            return Status{ErrorCodes::IncompatibleShardingConfigVersion,
+                          str::stream()
+                              << "Request received from an older, incompatible mongodb version"};
         }
     }
 
@@ -134,20 +147,20 @@ StatusWith<MoveChunkRequest> MoveChunkRequest::createFromCommand(NamespaceString
 
 void MoveChunkRequest::appendAsCommand(BSONObjBuilder* builder,
                                        const NamespaceString& nss,
-                                       const ChunkVersion& shardVersion,
+                                       ChunkVersion chunkVersion,
                                        const ConnectionString& configServerConnectionString,
                                        const ShardId& fromShardId,
                                        const ShardId& toShardId,
                                        const ChunkRange& range,
                                        int64_t maxChunkSizeBytes,
                                        const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                       bool waitForDelete,
-                                       bool takeDistLock) {
+                                       bool waitForDelete) {
     invariant(builder->asTempObj().isEmpty());
     invariant(nss.isValid());
 
     builder->append(kMoveChunk, nss.ns());
-    shardVersion.appendForCommands(builder);
+    chunkVersion.appendForCommands(builder);  // 3.4 shard compatibility
+    builder->append(kEpoch, chunkVersion.epoch());
     builder->append(kConfigServerConnectionString, configServerConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());
     builder->append(kToShardId, toShardId.toString());
@@ -155,7 +168,7 @@ void MoveChunkRequest::appendAsCommand(BSONObjBuilder* builder,
     builder->append(kMaxChunkSizeBytes, static_cast<long long>(maxChunkSizeBytes));
     secondaryThrottle.append(builder);
     builder->append(kWaitForDelete, waitForDelete);
-    builder->append(kTakeDistLock, takeDistLock);
+    builder->append(kTakeDistLock, false);
 }
 
 bool MoveChunkRequest::operator==(const MoveChunkRequest& other) const {
@@ -169,20 +182,20 @@ bool MoveChunkRequest::operator==(const MoveChunkRequest& other) const {
         return false;
     if (_range != other._range)
         return false;
-    if (_maxChunkSizeBytes != other._maxChunkSizeBytes)
-        return false;
-    if (_secondaryThrottle != other._secondaryThrottle)
-        return false;
-    if (_waitForDelete != other._waitForDelete)
-        return false;
-    if (_takeDistLock != other._takeDistLock)
-        return false;
 
     return true;
 }
 
 bool MoveChunkRequest::operator!=(const MoveChunkRequest& other) const {
     return !(*this == other);
+}
+
+std::string MoveChunkRequest::toString() const {
+    std::stringstream ss;
+    ss << "ns: " << getNss().ns() << ", " << redact(ChunkRange(getMinKey(), getMaxKey()).toString())
+       << ", fromShard: " << getFromShardId() << ", toShard: " << getToShardId();
+
+    return ss.str();
 }
 
 }  // namespace mongo

@@ -103,9 +103,7 @@ protected:
     /**
      * Gets the replication executor under test.
      */
-    ReplicationExecutor* getReplExec() {
-        return _replExec.get();
-    }
+    ReplicationExecutor* getReplExec();
 
     /**
      * Gets the replication coordinator under test.
@@ -218,12 +216,19 @@ protected:
 
     /**
      * Brings the repl coord from SECONDARY to PRIMARY by simulating the messages required to
-     * elect it.
+     * elect it, after progressing the mocked-out notion of time past the election timeout.
      *
      * Behavior is unspecified if node does not have a clean config, is not in SECONDARY, etc.
      */
     void simulateSuccessfulElection();
     void simulateSuccessfulV1Election();
+
+    /**
+     * Same as simulateSuccessfulV1Election, but rather than getting the election timeout and
+     * progressing time past that point, takes in what time to expect an election to occur at.
+     * Useful for simulating elections triggered via priority takeover.
+     */
+    void simulateSuccessfulV1ElectionAt(Date_t electionTime);
 
     /**
      * Shuts down the objects under test.
@@ -235,16 +240,6 @@ protected:
      */
     void replyToReceivedHeartbeat();
     void replyToReceivedHeartbeatV1();
-
-    /**
-     * Sets how the test fixture reports the storage engine's durability feature.
-     */
-    void setStorageEngineDurable(bool val = true) {
-        _isStorageEngineDurable = val;
-    }
-    bool isStorageEngineDurable() const {
-        return _isStorageEngineDurable;
-    }
 
     void simulateEnoughHeartbeatsForAllNodesUp();
 
@@ -258,18 +253,21 @@ protected:
      */
     void disableSnapshots();
 
+    /**
+     * Timeout all freshness scan request for primary catch-up.
+     */
+    void simulateCatchUpTimeout();
+
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;
     // Owned by ReplicationCoordinatorImpl
     TopologyCoordinatorImpl* _topo = nullptr;
     // Owned by ReplicationExecutor
     executor::NetworkInterfaceMock* _net = nullptr;
-    std::unique_ptr<ReplicationExecutor> _replExec;
     // Owned by ReplicationCoordinatorImpl
     ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
     ReplSettings _settings;
     bool _callShutdown = false;
-    bool _isStorageEngineDurable = true;
     ServiceContext::UniqueClient _client = getGlobalServiceContext()->makeClient("testClient");
 };
 

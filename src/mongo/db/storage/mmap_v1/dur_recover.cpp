@@ -345,7 +345,7 @@ void RecoveryJob::applyEntry(Last& last, const ParsedJournalEntry& entry, bool a
                 ss << setw(2) << entry.e->getFileNo();
             ss << ' ' << setw(6) << entry.e->len << ' '
                << /*hex << setw(8) << (size_t) fqe.srcData << dec <<*/
-                "  " << hexdump(entry.e->srcData(), entry.e->len);
+                "  " << redact(hexdump(entry.e->srcData(), entry.e->len));
             log() << ss.str() << endl;
         }
         if (apply) {
@@ -354,7 +354,7 @@ void RecoveryJob::applyEntry(Last& last, const ParsedJournalEntry& entry, bool a
     } else if (entry.op) {
         // a DurOp subclass operation
         if (dump) {
-            log() << "  OP " << entry.op->toString() << endl;
+            log() << "  OP " << redact(entry.op->toString()) << endl;
         }
         if (apply) {
             if (entry.op->needFilesClosed()) {
@@ -526,7 +526,9 @@ bool RecoveryJob::processFileBuffer(const void* p, unsigned len) {
             processSection((const JSectHeader*)hdr, data, dataLen, (const JSectFooter*)footer);
 
             // ctrl c check
-            uassert(ErrorCodes::Interrupted, "interrupted during journal recovery", !inShutdown());
+            uassert(ErrorCodes::Interrupted,
+                    "interrupted during journal recovery",
+                    !globalInShutdownDeprecated());
         }
     } catch (const BufReader::eof&) {
         if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)

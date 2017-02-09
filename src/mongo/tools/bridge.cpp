@@ -128,6 +128,7 @@ public:
 
         Message request;
         Message response;
+        MessageCompressorManager compressorManager;
 
         while (true) {
             try {
@@ -136,6 +137,16 @@ public:
                     log() << "end connection " << _mp->remote().toString();
                     _mp->shutdown();
                     break;
+                }
+
+                if (request.operation() == dbCompressed) {
+                    auto swm = compressorManager.decompressMessage(request);
+                    if (!swm.isOK()) {
+                        error() << "Error decompressing message: " << swm.getStatus();
+                        _mp->shutdown();
+                        return;
+                    }
+                    request = std::move(swm.getValue());
                 }
 
                 std::unique_ptr<rpc::RequestInterface> cmdRequest;
@@ -245,6 +256,16 @@ public:
                         exhaust = q.queryOptions & QueryOption_Exhaust;
                     }
                     while (exhaust) {
+                        if (response.operation() == dbCompressed) {
+                            auto swm = compressorManager.decompressMessage(response);
+                            if (!swm.isOK()) {
+                                error() << "Error decompressing message: " << swm.getStatus();
+                                _mp->shutdown();
+                                return;
+                            }
+                            response = std::move(swm.getValue());
+                        }
+
                         MsgData::View header = response.header();
                         QueryResult::View qr = header.view2ptr();
                         if (qr.getCursorId()) {
@@ -272,12 +293,12 @@ public:
 
 private:
     Status runBridgeCommand(StringData cmdName, BSONObj cmdObj) {
-        auto status = Command::findCommand(cmdName);
+        auto status = BridgeCommand::findCommand(cmdName);
         if (!status.isOK()) {
             return status.getStatus();
         }
 
-        Command* command = status.getValue();
+        BridgeCommand* command = status.getValue();
         return command->run(cmdObj, _settingsMutex, _settings);
     }
 
@@ -320,17 +341,17 @@ public:
         log() << "Setting random seed: " << mongoBridgeGlobalParams.seed;
     }
 
-    void accepted(AbstractMessagingPort* mp) override final {
+    void accepted(std::unique_ptr<AbstractMessagingPort> mp) override final {
         {
             stdx::lock_guard<stdx::mutex> lk(_portsMutex);
             if (_inShutdown.load()) {
                 mp->shutdown();
                 return;
             }
-            _ports.insert(mp);
+            _ports.insert(mp.get());
         }
 
-        Forwarder f(mp, &_settingsMutex, &_settings, _seedSource.nextInt64());
+        Forwarder f(mp.release(), &_settingsMutex, &_settings, _seedSource.nextInt64());
         stdx::thread t(f);
         t.detach();
     }
@@ -362,8 +383,6 @@ MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
 
 }  // namespace
 
-void logProcessDetailsForLogRotate() {}
-
 int bridgeMain(int argc, char** argv, char** envp) {
     static StaticObserver staticObserver;
 
@@ -377,7 +396,7 @@ int bridgeMain(int argc, char** argv, char** envp) {
 
     setupSignalHandlers();
     runGlobalInitializersOrDie(argc, argv, envp);
-    startSignalProcessingThread();
+    startSignalProcessingThread(LogFileStatus::kNoLogFileToRotate);
 
     listener = stdx::make_unique<BridgeListener>();
     listener->setupSockets();

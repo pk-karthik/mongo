@@ -28,6 +28,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/ftdc/ftdc_mongod.h"
+
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <memory>
@@ -35,11 +37,11 @@
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
-
 #include "mongo/db/commands.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/config.h"
 #include "mongo/db/ftdc/controller.h"
+#include "mongo/db/ftdc/ftdc_system_stats.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -61,7 +63,7 @@ FTDCController* getGlobalFTDCController() {
     return getFTDCController(getGlobalServiceContext()).get();
 }
 
-std::atomic<bool> localEnabledFlag(FTDCConfig::kEnabledDefault);  // NOLINT
+AtomicBool localEnabledFlag(FTDCConfig::kEnabledDefault);
 
 class ExportedFTDCEnabledParameter
     : public ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> {
@@ -83,7 +85,7 @@ public:
 
 } exportedFTDCEnabledParameter;
 
-std::atomic<std::int32_t> localPeriodMillis(FTDCConfig::kPeriodMillisDefault);  // NOLINT
+AtomicInt32 localPeriodMillis(FTDCConfig::kPeriodMillisDefault);
 
 class ExportedFTDCPeriodParameter
     : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
@@ -112,11 +114,9 @@ public:
 } exportedFTDCPeriodParameter;
 
 // Scale the values down since are defaults are in bytes, but the user interface is MB
-std::atomic<std::int32_t> localMaxDirectorySizeMB(  // NOLINT
-    FTDCConfig::kMaxDirectorySizeBytesDefault / (1024 * 1024));
+AtomicInt32 localMaxDirectorySizeMB(FTDCConfig::kMaxDirectorySizeBytesDefault / (1024 * 1024));
 
-std::atomic<std::int32_t> localMaxFileSizeMB(FTDCConfig::kMaxFileSizeBytesDefault /  // NOLINT
-                                             (1024 * 1024));
+AtomicInt32 localMaxFileSizeMB(FTDCConfig::kMaxFileSizeBytesDefault / (1024 * 1024));
 
 class ExportedFTDCDirectorySizeParameter
     : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
@@ -134,12 +134,12 @@ public:
                 "diagnosticDataCollectionDirectorySizeMB must be greater than or equal to 10");
         }
 
-        if (potentialNewValue < localMaxFileSizeMB) {
+        if (potentialNewValue < localMaxFileSizeMB.load()) {
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
                     << "diagnosticDataCollectionDirectorySizeMB must be greater than or equal to '"
-                    << localMaxFileSizeMB
+                    << localMaxFileSizeMB.load()
                     << "' which is the current value of diagnosticDataCollectionFileSizeMB.");
         }
 
@@ -168,12 +168,12 @@ public:
                           "diagnosticDataCollectionFileSizeMB must be greater than or equal to 1");
         }
 
-        if (potentialNewValue > localMaxDirectorySizeMB) {
+        if (potentialNewValue > localMaxDirectorySizeMB.load()) {
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
                     << "diagnosticDataCollectionFileSizeMB must be less than or equal to '"
-                    << localMaxDirectorySizeMB
+                    << localMaxDirectorySizeMB.load()
                     << "' which is the current value of diagnosticDataCollectionDirectorySizeMB.");
         }
 
@@ -187,7 +187,7 @@ public:
 
 } exportedFTDCFileSizeParameter;
 
-std::atomic<std::int32_t> localMaxSamplesPerArchiveMetricChunk(  // NOLINT
+AtomicInt32 localMaxSamplesPerArchiveMetricChunk(
     FTDCConfig::kMaxSamplesPerArchiveMetricChunkDefault);
 
 class ExportedFTDCArchiveChunkSizeParameter
@@ -216,7 +216,7 @@ public:
 
 } exportedFTDCArchiveChunkSizeParameter;
 
-std::atomic<std::int32_t> localMaxSamplesPerInterimMetricChunk(  // NOLINT
+AtomicInt32 localMaxSamplesPerInterimMetricChunk(
     FTDCConfig::kMaxSamplesPerInterimMetricChunkDefault);
 
 class ExportedFTDCInterimChunkSizeParameter
@@ -283,7 +283,6 @@ private:
 
 }  // namespace
 
-
 // Register the FTDC system
 // Note: This must be run before the server parameters are parsed during startup
 // so that the FTDCController is initialized.
@@ -295,20 +294,29 @@ void startFTDC() {
 
     FTDCConfig config;
     config.period = Milliseconds(localPeriodMillis.load());
-    config.enabled = localEnabledFlag;
-    config.maxFileSizeBytes = localMaxFileSizeMB * 1024 * 1024;
-    config.maxDirectorySizeBytes = localMaxDirectorySizeMB * 1024 * 1024;
-    config.maxSamplesPerArchiveMetricChunk = localMaxSamplesPerArchiveMetricChunk;
-    config.maxSamplesPerInterimMetricChunk = localMaxSamplesPerInterimMetricChunk;
+    config.enabled = localEnabledFlag.load();
+    config.maxFileSizeBytes = localMaxFileSizeMB.load() * 1024 * 1024;
+    config.maxDirectorySizeBytes = localMaxDirectorySizeMB.load() * 1024 * 1024;
+    config.maxSamplesPerArchiveMetricChunk = localMaxSamplesPerArchiveMetricChunk.load();
+    config.maxSamplesPerInterimMetricChunk = localMaxSamplesPerInterimMetricChunk.load();
 
     auto controller = stdx::make_unique<FTDCController>(dir, config);
 
     // Install periodic collectors
     // These are collected on the period interval in FTDCConfig.
+    // NOTE: For each command here, there must be an equivalent privilege check in
+    // GetDiagnosticDataCommand
 
     // CmdServerStatus
+    // The "sharding" section is filtered out because at this time it only consists of strings in
+    // migration status. This section triggers too many schema changes in the serverStatus which
+    // hurt ftdc compression efficiency, because its output varies depending on the list of active
+    // migrations.
     controller->addPeriodicCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
-        "serverStatus", "serverStatus", "", BSON("serverStatus" << 1 << "tcMalloc" << true)));
+        "serverStatus",
+        "serverStatus",
+        "",
+        BSON("serverStatus" << 1 << "tcMalloc" << true << "sharding" << false)));
 
     // These metrics are only collected if replication is enabled
     if (repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
@@ -325,6 +333,9 @@ void startFTDC() {
                                                                   BSON("collStats"
                                                                        << "oplog.rs")));
     }
+
+    // Install System Metric Collector as a periodic collector
+    installSystemMetricsCollector(controller.get());
 
     // Install file rotation collectors
     // These are collected on each file rotation.
@@ -355,6 +366,10 @@ void stopFTDC() {
     if (controller) {
         controller->stop();
     }
+}
+
+FTDCController* FTDCController::get(ServiceContext* serviceContext) {
+    return getFTDCController(serviceContext).get();
 }
 
 }  // namespace mongo

@@ -154,10 +154,6 @@ class test_config04(wttest.WiredTigerTestCase):
                                  'eviction_trigger=86'),
             "/eviction target must be lower than the eviction trigger/")
 
-    def test_hazard_max(self):
-        # Note: There isn't any direct way to know that this was set.
-        self.common_test('hazard_max=50')
-
     def test_invalid_config(self):
         msg = '/Unbalanced brackets/'
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
@@ -197,7 +193,7 @@ class test_config04(wttest.WiredTigerTestCase):
 
         # Test an absolute path directory.
         if os.name == 'posix':
-            logdir = '/tmp/logdir'
+            logdir = os.path.abspath('absolutelogdir')
             os.mkdir(logdir)
             confstr = 'path=' + logdir
             self.common_log_test(confstr, logdir)

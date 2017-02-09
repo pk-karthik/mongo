@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
     target='sharding_client',
     source=[
@@ -15,17 +17,21 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/client/fetcher',
-        '$BUILD_DIR/mongo/client/remote_command_runner_impl',
         '$BUILD_DIR/mongo/client/remote_command_targeter',
         '$BUILD_DIR/mongo/executor/connection_pool_stats',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/rpc/metadata',
+        '$BUILD_DIR/mongo/s/cluster_last_error_info',
+        '$BUILD_DIR/mongo/s/is_mongos',
         'shard_interface',
+        '$BUILD_DIR/mongo/db/lasterror',
+        '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/auth/authcore',
+        #'$BUILD_DIR/mongo/s/coreshard', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Circular with both coreshard and coredb! Also relies on some
-        # symbols that are not uniquely defined.
-        'incomplete',
+        # TODO(ADAM, 2017,01-06): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -78,6 +84,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/remote_command_retry_scheduler',
         '$BUILD_DIR/mongo/s/shard_id',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
     ]
@@ -90,13 +97,10 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',
         'shard_interface'
     ],
-    LIBDEPS_TAGS=[
-        # Depends on DBDirectClient
-        'incomplete',
-    ],
-
 )
 
 env.CppUnitTest(

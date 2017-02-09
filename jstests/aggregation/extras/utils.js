@@ -3,10 +3,20 @@
  * of 'coll' with a single empty document.
  */
 function testExpression(coll, expression, result) {
+    testExpressionWithCollation(coll, expression, result);
+}
+
+/**
+ * Compute the result of evaluating 'expression', and compare it to 'result', using 'collationSpec'
+ * as the collation spec. Replaces the contents of 'coll' with a single empty document.
+ */
+function testExpressionWithCollation(coll, expression, result, collationSpec) {
     coll.remove({});
     coll.insert({});
 
-    var res = coll.aggregate({$project: {output: expression}}).toArray();
+    var options = collationSpec !== undefined ? {collation: collationSpec} : undefined;
+
+    var res = coll.aggregate([{$project: {output: expression}}], options).toArray();
 
     assert.eq(res.length, 1, tojson(res));
     assert.eq(res[0].output, result, tojson(res));
@@ -249,16 +259,6 @@ function assertErrorCode(coll, pipe, code, errmsg) {
         pipe = [pipe];
     }
 
-    // Test non-cursor
-    var res = coll.runCommand("aggregate", {pipeline: pipe});
-    if (res.ok || res.code != code)
-        printjson({pipeline: pipe, result: res});
-
-    /* assert failure with proper error code */
-    assert(!res.ok, errmsg || "failed in assertErrorCode");
-    assert.eq(res.code, code);
-
-    // Test with cursors
     var cmd = {pipeline: pipe};
     // cmd.cursor = {};
     cmd.cursor = {batchSize: 0};

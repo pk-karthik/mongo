@@ -29,9 +29,9 @@
 #pragma once
 
 #include <algorithm>
-#include <boost/config.hpp>
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/base/static_assert.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
@@ -168,7 +168,7 @@ public:
         memcpyed();
     }
 
-    ValueStorage(ValueStorage&& rhs) BOOST_NOEXCEPT {
+    ValueStorage(ValueStorage&& rhs) noexcept {
         memcpy(this, &rhs, sizeof(*this));
         rhs.zero();  // Reset rhs to the missing state. TODO consider only doing this if refCounter.
     }
@@ -196,7 +196,7 @@ public:
         return *this;
     }
 
-    ValueStorage& operator=(ValueStorage&& rhs) BOOST_NOEXCEPT {
+    ValueStorage& operator=(ValueStorage&& rhs) noexcept {
         DEV verifyRefCountingIfShould();
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);
@@ -358,6 +358,6 @@ public:
         long long i64[2];
     };
 };
-static_assert(sizeof(ValueStorage) == 16, "sizeof(ValueStorage) == 16");
+MONGO_STATIC_ASSERT(sizeof(ValueStorage) == 16);
 #pragma pack()
 }

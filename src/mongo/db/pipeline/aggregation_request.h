@@ -54,6 +54,7 @@ public:
     static const StringData kCollationName;
     static const StringData kExplainName;
     static const StringData kAllowDiskUseName;
+    static const StringData kHintName;
 
     static const long long kDefaultBatchSize;
 
@@ -81,7 +82,7 @@ public:
     // Getters.
     //
 
-    boost::optional<long long> getBatchSize() const {
+    long long getBatchSize() const {
         return _batchSize;
     }
 
@@ -94,10 +95,6 @@ public:
      */
     const std::vector<BSONObj>& getPipeline() const {
         return _pipeline;
-    }
-
-    bool isCursorCommand() const {
-        return _cursorCommand;
     }
 
     bool isExplain() const {
@@ -123,13 +120,16 @@ public:
         return _collation;
     }
 
+    BSONObj getHint() const {
+        return _hint;
+    }
+
     //
     // Setters for optional fields.
     //
 
     /**
-     * Must be either unset or non-negative. Negative batchSize is illegal but batchSize of 0 is
-     * allowed.
+     * Negative batchSize is illegal but batchSize of 0 is allowed.
      */
     void setBatchSize(long long batchSize) {
         uassert(40203, "batchSize must be non-negative", batchSize >= 0);
@@ -140,8 +140,8 @@ public:
         _collation = collation.getOwned();
     }
 
-    void setCursorCommand(bool isCursorCommand) {
-        _cursorCommand = isCursorCommand;
+    void setHint(BSONObj hint) {
+        _hint = hint.getOwned();
     }
 
     void setExplain(bool isExplain) {
@@ -168,18 +168,22 @@ private:
     // An unparsed version of the pipeline.
     const std::vector<BSONObj> _pipeline;
 
-    // Optional fields.
+    long long _batchSize;
 
-    boost::optional<long long> _batchSize;
+    // Optional fields.
 
     // An owned copy of the user-specified collation object, or an empty object if no collation was
     // specified.
     BSONObj _collation;
 
+    // The hint provided, if any.  If the hint was by index key pattern, the value of '_hint' is
+    // the key pattern hinted.  If the hint was by index name, the value of '_hint' is
+    // {$hint: <String>}, where <String> is the index name hinted.
+    BSONObj _hint;
+
     bool _explain = false;
     bool _allowDiskUse = false;
     bool _fromRouter = false;
     bool _bypassDocumentValidation = false;
-    bool _cursorCommand = false;
 };
 }  // namespace mongo

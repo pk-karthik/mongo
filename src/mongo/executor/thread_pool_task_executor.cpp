@@ -34,6 +34,7 @@
 
 #include <boost/optional.hpp>
 #include <iterator>
+#include <utility>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/disallow_copying.h"
@@ -187,8 +188,30 @@ void ThreadPoolTaskExecutor::join() {
     invariant(_unsignaledEvents.empty());
 }
 
-std::string ThreadPoolTaskExecutor::getDiagnosticString() {
-    return {};
+BSONObj ThreadPoolTaskExecutor::_getDiagnosticBSON() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    BSONObjBuilder builder;
+
+    // ThreadPool details
+    // TODO: fill in
+    BSONObjBuilder poolCounters(builder.subobjStart("pool"));
+    poolCounters.appendIntOrLL("inProgressCount", _poolInProgressQueue.size());
+    poolCounters.done();
+
+    // Queues
+    BSONObjBuilder queues(builder.subobjStart("queues"));
+    queues.appendIntOrLL("networkInProgress", _networkInProgressQueue.size());
+    queues.appendIntOrLL("sleepers", _sleepersQueue.size());
+    queues.done();
+
+    builder.appendIntOrLL("unsignaledEvents", _unsignaledEvents.size());
+    builder.append("shuttingDown", _inShutdown);
+    builder.append("networkInterface", _net->getDiagnosticString());
+    return builder.obj();
+}
+
+std::string ThreadPoolTaskExecutor::getDiagnosticString() const {
+    return _getDiagnosticBSON().toString();
 }
 
 Date_t ThreadPoolTaskExecutor::now() {
@@ -282,35 +305,29 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWorkAt(
 
 namespace {
 
+using ResponseStatus = TaskExecutor::ResponseStatus;
+
 // If the request received a connection from the pool but failed in its execution,
-// convert the raw Status in cbData to a StatusWith<RemoteCommandResponse> so that the callback,
-// which expects a StatusWith<RemoteCommandResponse> as part of RemoteCommandCallbackArgs,
+// convert the raw Status in cbData to a RemoteCommandResponse so that the callback,
+// which expects a RemoteCommandResponse as part of RemoteCommandCallbackArgs,
 // can be run despite a RemoteCommandResponse never having been created.
 void remoteCommandFinished(const TaskExecutor::CallbackArgs& cbData,
                            const TaskExecutor::RemoteCommandCallbackFn& cb,
                            const RemoteCommandRequest& request,
-                           const TaskExecutor::ResponseStatus& response) {
-    using ResponseStatus = TaskExecutor::ResponseStatus;
-    if (cbData.status.isOK()) {
-        cb(TaskExecutor::RemoteCommandCallbackArgs(
-            cbData.executor, cbData.myHandle, request, response));
-    } else {
-        cb(TaskExecutor::RemoteCommandCallbackArgs(
-            cbData.executor, cbData.myHandle, request, ResponseStatus(cbData.status)));
-    }
+                           const ResponseStatus& rs) {
+    cb(TaskExecutor::RemoteCommandCallbackArgs(cbData.executor, cbData.myHandle, request, rs));
 }
 
 // If the request failed to receive a connection from the pool,
-// convert the raw Status in cbData to a StatusWith<RemoteCommandResponse> so that the callback,
-// which expects a StatusWith<RemoteCommandResponse> as part of RemoteCommandCallbackArgs,
+// convert the raw Status in cbData to a RemoteCommandResponse so that the callback,
+// which expects a RemoteCommandResponse as part of RemoteCommandCallbackArgs,
 // can be run despite a RemoteCommandResponse never having been created.
 void remoteCommandFailedEarly(const TaskExecutor::CallbackArgs& cbData,
                               const TaskExecutor::RemoteCommandCallbackFn& cb,
                               const RemoteCommandRequest& request) {
-    using ResponseStatus = TaskExecutor::ResponseStatus;
     invariant(!cbData.status.isOK());
     cb(TaskExecutor::RemoteCommandCallbackArgs(
-        cbData.executor, cbData.myHandle, request, ResponseStatus(cbData.status)));
+        cbData.executor, cbData.myHandle, request, {cbData.status}));
 }
 }  // namespace
 
@@ -334,7 +351,7 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
     if (!cbHandle.isOK())
         return cbHandle;
     const auto cbState = _networkInProgressQueue.back();
-    LOG(3) << "Scheduling remote command request: " << scheduledRequest.toString();
+    LOG(3) << "Scheduling remote command request: " << redact(scheduledRequest.toString());
     lk.unlock();
     _net->startCommand(
         cbHandle.getValue(),
@@ -349,8 +366,7 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
                 return;
             }
             LOG(3) << "Received remote response: "
-                   << (response.isOK() ? response.getValue().toString()
-                                       : response.getStatus().toString());
+                   << redact(response.isOK() ? response.toString() : response.status.toString());
             swap(cbState->callback, newCb);
             scheduleIntoPool_inlock(&_networkInProgressQueue, cbState->iter, std::move(lk));
         });
@@ -399,10 +415,6 @@ void ThreadPoolTaskExecutor::wait(const CallbackHandle& cbHandle) {
 
 void ThreadPoolTaskExecutor::appendConnectionStats(ConnectionPoolStats* stats) const {
     _net->appendConnectionStats(stats);
-}
-
-void ThreadPoolTaskExecutor::cancelAllCommands() {
-    _net->cancelAllCommands();
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::enqueueCallbackState_inlock(
@@ -490,7 +502,15 @@ void ThreadPoolTaskExecutor::runCallback(std::shared_ptr<CallbackState> cbStateA
                           ? Status({ErrorCodes::CallbackCanceled, "Callback canceled"})
                           : Status::OK());
     invariant(!cbStateArg->isFinished.load());
-    cbStateArg->callback(std::move(args));
+    {
+        // After running callback function, clear 'cbStateArg->callback' to release any resources
+        // that might be held by this function object.
+        // Swap 'cbStateArg->callback' with temporary copy before running callback for exception
+        // safety.
+        TaskExecutor::CallbackFn callback;
+        std::swap(cbStateArg->callback, callback);
+        callback(std::move(args));
+    }
     cbStateArg->isFinished.store(true);
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _poolInProgressQueue.erase(cbStateArg->iter);

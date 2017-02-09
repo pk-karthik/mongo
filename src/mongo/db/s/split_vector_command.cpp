@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -61,9 +62,9 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-namespace dps = ::mongo::dotted_path_support;
-
 namespace {
+
+const int kMaxObjectPerChunk{250000};
 
 BSONObj prettyKey(const BSONObj& keyPattern, const BSONObj& key) {
     return key.replaceFieldNames(keyPattern).clientReadable();
@@ -72,13 +73,16 @@ BSONObj prettyKey(const BSONObj& keyPattern, const BSONObj& key) {
 class SplitVector : public Command {
 public:
     SplitVector() : Command("splitVector", false) {}
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
+
+    bool slaveOk() const override {
         return false;
     }
-    virtual void help(stringstream& help) const {
+
+    void help(stringstream& help) const override {
         help << "Internal command.\n"
                 "examples:\n"
                 "  { splitVector : \"blog.post\" , keyPattern:{x:1} , min:{x:10} , max:{x:20}, "
@@ -92,9 +96,10 @@ public:
                 "  'force' will produce one split point even if data is small; defaults to false\n"
                 "NOTE: This command may take a while to run";
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::splitVector)) {
@@ -102,15 +107,17 @@ public:
         }
         return Status::OK();
     }
-    virtual std::string parseNs(const string& dbname, const BSONObj& cmdObj) const {
+
+    std::string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
         return parseNsFullyQualified(dbname, cmdObj);
     }
+
     bool run(OperationContext* txn,
              const string& dbname,
              BSONObj& jsobj,
-             int,
+             int options,
              string& errmsg,
-             BSONObjBuilder& result) {
+             BSONObjBuilder& result) override {
         //
         // 1.a We'll parse the parameters in two steps. First, make sure the we can use the split
         //     index to get a good approximation of the size of the chunk -- without needing to
@@ -140,7 +147,7 @@ public:
             maxSplitPoints = maxSplitPointsElem.numberLong();
         }
 
-        long long maxChunkObjects = Chunk::MaxObjectPerChunk;
+        long long maxChunkObjects = kMaxObjectPerChunk;
         BSONElement MaxChunkObjectsElem = jsobj["maxChunkObjects"];
         if (MaxChunkObjectsElem.isNumber()) {
             maxChunkObjects = MaxChunkObjectsElem.numberLong();
@@ -228,8 +235,8 @@ public:
                 return true;
             }
 
-            log() << "request split points lookup for chunk " << nss.toString() << " " << min
-                  << " -->> " << max;
+            log() << "request split points lookup for chunk " << nss.toString() << " "
+                  << redact(min) << " -->> " << redact(max);
 
             // We'll use the average object size and number of object to find approximately how many
             // keys each chunk should have. We'll split at half the maxChunkSize or maxChunkObjects,
@@ -252,14 +259,15 @@ public:
             long long currCount = 0;
             long long numChunks = 0;
 
-            unique_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,
-                                                                     collection,
-                                                                     idx,
-                                                                     min,
-                                                                     max,
-                                                                     false,  // endKeyInclusive
-                                                                     PlanExecutor::YIELD_MANUAL,
-                                                                     InternalPlanner::FORWARD));
+            unique_ptr<PlanExecutor> exec(
+                InternalPlanner::indexScan(txn,
+                                           collection,
+                                           idx,
+                                           min,
+                                           max,
+                                           BoundInclusion::kIncludeStartKeyOnly,
+                                           PlanExecutor::YIELD_MANUAL,
+                                           InternalPlanner::FORWARD));
 
             BSONObj currKey;
             PlanExecutor::ExecState state = exec->getNext(&currKey, NULL);
@@ -271,8 +279,8 @@ public:
             // Use every 'keyCount'-th key as a split point. We add the initial key as a sentinel,
             // to be removed at the end. If a key appears more times than entries allowed on a
             // chunk, we issue a warning and split on the following key.
-            set<BSONObj> tooFrequentKeys;
-            splitKeys.push_back(dps::extractElementsBasedOnTemplate(
+            auto tooFrequentKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+            splitKeys.push_back(dotted_path_support::extractElementsBasedOnTemplate(
                 prettyKey(idx->keyPattern(), currKey.getOwned()), keyPattern));
 
             exec->setYieldPolicy(PlanExecutor::YIELD_AUTO, collection);
@@ -281,7 +289,7 @@ public:
                     currCount++;
 
                     if (currCount > keyCount && !forceMedianSplit) {
-                        currKey = dps::extractElementsBasedOnTemplate(
+                        currKey = dotted_path_support::extractElementsBasedOnTemplate(
                             prettyKey(idx->keyPattern(), currKey.getOwned()), keyPattern);
                         // Do not use this split key if it is the same used in the previous split
                         // point.
@@ -291,15 +299,15 @@ public:
                             splitKeys.push_back(currKey.getOwned());
                             currCount = 0;
                             numChunks++;
-                            LOG(4) << "picked a split key: " << currKey;
+                            LOG(4) << "picked a split key: " << redact(currKey);
                         }
                     }
 
                     // Stop if we have enough split points.
                     if (maxSplitPoints && (numChunks >= maxSplitPoints)) {
                         log() << "max number of requested split points reached (" << numChunks
-                              << ") before the end of chunk " << nss.toString() << " " << min
-                              << " -->> " << max;
+                              << ") before the end of chunk " << nss.toString() << " "
+                              << redact(min) << " -->> " << redact(max);
                         break;
                     }
 
@@ -333,7 +341,7 @@ public:
                                                   idx,
                                                   min,
                                                   max,
-                                                  false,  // endKeyInclusive
+                                                  BoundInclusion::kIncludeStartKeyOnly,
                                                   PlanExecutor::YIELD_MANUAL,
                                                   InternalPlanner::FORWARD);
 
@@ -347,9 +355,7 @@ public:
             //
 
             // Warn for keys that are more numerous than maxChunkSize allows.
-            for (set<BSONObj>::const_iterator it = tooFrequentKeys.begin();
-                 it != tooFrequentKeys.end();
-                 ++it) {
+            for (auto it = tooFrequentKeys.cbegin(); it != tooFrequentKeys.cend(); ++it) {
                 warning() << "possible low cardinality key detected in " << nss.toString()
                           << " - key is " << prettyKey(idx->keyPattern(), *it);
             }
@@ -359,7 +365,7 @@ public:
 
             if (timer.millis() > serverGlobalParams.slowMS) {
                 warning() << "Finding the split vector for " << nss.toString() << " over "
-                          << keyPattern << " keyCount: " << keyCount
+                          << redact(keyPattern) << " keyCount: " << keyCount
                           << " numSplits: " << splitKeys.size() << " lookedAt: " << currCount
                           << " took " << timer.millis() << "ms";
             }
@@ -371,9 +377,8 @@ public:
         }
 
         // Make sure splitKeys is in ascending order
-        std::sort(splitKeys.begin(),
-                  splitKeys.end(),
-                  [](const BSONObj& lhs, const BSONObj& rhs) -> bool { return lhs < rhs; });
+        std::sort(
+            splitKeys.begin(), splitKeys.end(), SimpleBSONObjComparator::kInstance.makeLessThan());
         result.append("splitKeys", splitKeys);
         return true;
     }

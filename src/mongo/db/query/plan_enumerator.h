@@ -43,8 +43,8 @@ namespace mongo {
 struct PlanEnumeratorParams {
     PlanEnumeratorParams()
         : intersect(false),
-          maxSolutionsPerOr(internalQueryEnumerationMaxOrSolutions),
-          maxIntersectPerAnd(internalQueryEnumerationMaxIntersectPerAnd) {}
+          maxSolutionsPerOr(internalQueryEnumerationMaxOrSolutions.load()),
+          maxIntersectPerAnd(internalQueryEnumerationMaxIntersectPerAnd.load()) {}
 
     // Do we provide solutions that use more indices than the minimum required to provide
     // an indexed solution?
@@ -102,6 +102,9 @@ public:
      *
      * Nodes in 'tree' are tagged with indices that should be used to answer the tagged nodes.
      * Only nodes that have a field name (isLogical() == false) will be tagged.
+     *
+     * The output tree is a clone identical to that used to initialize the enumerator, with tags
+     * added in order to indicate index usage.
      */
     bool getNext(MatchExpression** tree);
 

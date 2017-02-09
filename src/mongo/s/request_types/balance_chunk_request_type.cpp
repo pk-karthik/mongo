@@ -32,6 +32,8 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/request_types/balance_chunk_request_type.h"
 
 namespace mongo {
 namespace {
@@ -42,6 +44,10 @@ const char kToShardId[] = "toShard";
 const char kSecondaryThrottle[] = "secondaryThrottle";
 const char kWaitForDelete[] = "waitForDelete";
 
+const WriteConcernOptions kMajorityWriteConcernNoTimeout(WriteConcernOptions::kMajority,
+                                                         WriteConcernOptions::SyncMode::UNSET,
+                                                         Seconds(15));
+
 }  // namespace
 
 BalanceChunkRequest::BalanceChunkRequest(ChunkType chunk,
@@ -49,7 +55,7 @@ BalanceChunkRequest::BalanceChunkRequest(ChunkType chunk,
     : _chunk(std::move(chunk)), _secondaryThrottle(std::move(secondaryThrottle)) {}
 
 StatusWith<BalanceChunkRequest> BalanceChunkRequest::parseFromConfigCommand(const BSONObj& obj) {
-    auto chunkStatus = ChunkType::fromBSON(obj);
+    auto chunkStatus = ChunkType::fromConfigBSON(obj);
     if (!chunkStatus.isOK()) {
         return chunkStatus.getStatus();
     }
@@ -126,7 +132,7 @@ BSONObj BalanceChunkRequest::serializeToMoveCommandForConfig(
 
     BSONObjBuilder cmdBuilder;
     cmdBuilder.append(kConfigSvrMoveChunk, 1);
-    cmdBuilder.appendElements(chunk.toBSON());
+    cmdBuilder.appendElements(chunk.toConfigBSON());
     cmdBuilder.append(kToShardId, newShardId.toString());
     cmdBuilder.append(kMaxChunkSizeBytes, static_cast<long long>(maxChunkSizeBytes));
     {
@@ -135,6 +141,8 @@ BSONObj BalanceChunkRequest::serializeToMoveCommandForConfig(
         secondaryThrottleBuilder.doneFast();
     }
     cmdBuilder.append(kWaitForDelete, waitForDelete);
+    cmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                      kMajorityWriteConcernNoTimeout.toBSON());
 
     return cmdBuilder.obj();
 }
@@ -144,7 +152,9 @@ BSONObj BalanceChunkRequest::serializeToRebalanceCommandForConfig(const ChunkTyp
 
     BSONObjBuilder cmdBuilder;
     cmdBuilder.append(kConfigSvrMoveChunk, 1);
-    cmdBuilder.appendElements(chunk.toBSON());
+    cmdBuilder.appendElements(chunk.toConfigBSON());
+    cmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                      kMajorityWriteConcernNoTimeout.toBSON());
 
     return cmdBuilder.obj();
 }

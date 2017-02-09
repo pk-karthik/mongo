@@ -26,19 +26,28 @@
  *    it in the license file.
  */
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_bucket.h"
+
+#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 using std::vector;
 
-REGISTER_DOCUMENT_SOURCE_ALIAS(bucket, DocumentSourceBucket::createFromBson);
+REGISTER_MULTI_STAGE_ALIAS(bucket,
+                           LiteParsedDocumentSourceDefault::parse,
+                           DocumentSourceBucket::createFromBson);
 
 namespace {
-intrusive_ptr<ExpressionConstant> getExpressionConstant(BSONElement expressionElem,
-                                                        VariablesParseState vps) {
-    auto expr = Expression::parseOperand(expressionElem, vps)->optimize();
+intrusive_ptr<ExpressionConstant> getExpressionConstant(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expressionElem,
+    VariablesParseState vps) {
+    auto expr = Expression::parseOperand(expCtx, expressionElem, vps)->optimize();
     return dynamic_cast<ExpressionConstant*>(expr.get());
 }
 }  // namespace
@@ -88,7 +97,7 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
                 argument.type() == BSONType::Array);
 
             for (auto&& boundaryElem : argument.embeddedObject()) {
-                auto exprConst = getExpressionConstant(boundaryElem, vps);
+                auto exprConst = getExpressionConstant(pExpCtx, boundaryElem, vps);
                 uassert(40191,
                         str::stream() << "The $bucket 'boundaries' field must be an array of "
                                          "constant values, but found value: "
@@ -132,12 +141,12 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
                             << " is not less than "
                             << upper.toString()
                             << ").",
-                        lower < upper);
+                        pExpCtx->getValueComparator().evaluate(lower < upper));
             }
         } else if ("default" == argName) {
             // If there is a default, make sure that it parses to a constant expression then add
             // default to switch.
-            auto exprConst = getExpressionConstant(argument, vps);
+            auto exprConst = getExpressionConstant(pExpCtx, argument, vps);
             uassert(40195,
                     str::stream()
                         << "The $bucket 'default' field must be a constant expression, but found: "
@@ -173,11 +182,12 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
     Value upperValue = boundaryValues.back();
     if (canonicalizeBSONType(defaultValue.getType()) ==
         canonicalizeBSONType(lowerValue.getType())) {
-        // If the default has the same canonical type as the bucket's boundaries, then make sure
-        // the default is less than the lowest boundary or greater than or equal to the highest
+        // If the default has the same canonical type as the bucket's boundaries, then make sure the
+        // default is less than the lowest boundary or greater than or equal to the highest
         // boundary.
-        const bool hasValidDefault =
-            defaultValue < lowerValue || Value::compare(defaultValue, upperValue) >= 0;
+        const auto& valueCmp = pExpCtx->getValueComparator();
+        const bool hasValidDefault = valueCmp.evaluate(defaultValue < lowerValue) ||
+            valueCmp.evaluate(defaultValue >= upperValue);
         uassert(40199,
                 "The $bucket 'default' field must be less than the lowest boundary or greater than "
                 "or equal to the highest boundary.",

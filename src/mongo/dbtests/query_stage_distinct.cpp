@@ -37,6 +37,7 @@
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
@@ -47,20 +48,22 @@
 
 namespace QueryStageDistinct {
 
+static const NamespaceString nss{"unittests.QueryStageDistinct"};
+
 class DistinctBase {
 public:
     DistinctBase() : _client(&_txn) {}
 
     virtual ~DistinctBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss.ns());
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_txn, nss.ns(), obj));
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss.ns(), obj);
     }
 
     /**
@@ -88,10 +91,6 @@ public:
         ASSERT_TRUE(keyElt.isNumber());
 
         return keyElt.numberInt();
-    }
-
-    static const char* ns() {
-        return "unittests.QueryStageDistinct";
     }
 
 protected:
@@ -122,13 +121,16 @@ public:
         // Make an index on a:1
         addIndex(BSON("a" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         Collection* coll = ctx.getCollection();
 
         // Set up the distinct stage.
+        std::vector<IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(&_txn, BSON("a" << 1), false, &indexes);
+        ASSERT_EQ(indexes.size(), 1U);
+
         DistinctParams params;
-        params.descriptor = coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, BSON("a" << 1));
-        verify(params.descriptor);
+        params.descriptor = indexes[0];
         params.direction = 1;
         // Distinct-ing over the 0-th field of the keypattern.
         params.fieldNo = 0;
@@ -186,12 +188,16 @@ public:
         // Make an index on a:1
         addIndex(BSON("a" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, ns());
+        AutoGetCollectionForRead ctx(&_txn, nss);
         Collection* coll = ctx.getCollection();
 
         // Set up the distinct stage.
+        std::vector<IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(&_txn, BSON("a" << 1), false, &indexes);
+        verify(indexes.size() == 1);
+
         DistinctParams params;
-        params.descriptor = coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, BSON("a" << 1));
+        params.descriptor = indexes[0];
         ASSERT_TRUE(params.descriptor->isMultikey(&_txn));
 
         verify(params.descriptor);
@@ -229,6 +235,76 @@ public:
     }
 };
 
+class QueryStageDistinctCompoundIndex : public DistinctBase {
+public:
+    void run() {
+        // insert documents with a: 1 and b: 1
+        for (size_t i = 0; i < 1000; ++i) {
+            insert(BSON("a" << 1 << "b" << 1));
+        }
+        // insert documents with a: 1 and b: 2
+        for (size_t i = 0; i < 1000; ++i) {
+            insert(BSON("a" << 1 << "b" << 2));
+        }
+        // insert documents with a: 2 and b: 1
+        for (size_t i = 0; i < 1000; ++i) {
+            insert(BSON("a" << 2 << "b" << 1));
+        }
+        // insert documents with a: 2 and b: 3
+        for (size_t i = 0; i < 1000; ++i) {
+            insert(BSON("a" << 2 << "b" << 3));
+        }
+
+        addIndex(BSON("a" << 1 << "b" << 1));
+
+        AutoGetCollectionForRead ctx(&_txn, nss);
+        Collection* coll = ctx.getCollection();
+
+        std::vector<IndexDescriptor*> indices;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(
+            &_txn, BSON("a" << 1 << "b" << 1), false, &indices);
+        ASSERT_EQ(1U, indices.size());
+
+        DistinctParams params;
+        params.descriptor = indices[0];
+        ASSERT_TRUE(params.descriptor);
+
+        params.direction = 1;
+        params.fieldNo = 1;
+        params.bounds.isSimpleRange = false;
+
+        OrderedIntervalList aOil{"a"};
+        aOil.intervals.push_back(IndexBoundsBuilder::allValues());
+        params.bounds.fields.push_back(aOil);
+
+        OrderedIntervalList bOil{"b"};
+        bOil.intervals.push_back(IndexBoundsBuilder::allValues());
+        params.bounds.fields.push_back(bOil);
+
+        WorkingSet ws;
+        DistinctScan distinct(&_txn, params, &ws);
+
+        WorkingSetID wsid;
+        PlanStage::StageState state;
+
+        std::vector<int> seen;
+
+        while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
+            ASSERT_NE(PlanStage::FAILURE, state);
+            ASSERT_NE(PlanStage::DEAD, state);
+            if (PlanStage::ADVANCED == state) {
+                seen.push_back(getIntFieldDotted(ws, wsid, "b"));
+            }
+        }
+
+        ASSERT_EQUALS(4U, seen.size());
+        ASSERT_EQUALS(1, seen[0]);
+        ASSERT_EQUALS(2, seen[1]);
+        ASSERT_EQUALS(1, seen[2]);
+        ASSERT_EQUALS(3, seen[3]);
+    }
+};
+
 // XXX: add a test case with bounds where skipping to the next key gets us a result that's not
 // valid w.r.t. our query.
 
@@ -239,6 +315,7 @@ public:
     void setupTests() {
         add<QueryStageDistinctBasic>();
         add<QueryStageDistinctMultiKey>();
+        add<QueryStageDistinctCompoundIndex>();
     }
 };
 

@@ -49,6 +49,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
@@ -120,10 +121,10 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbname, cmdObj));
         auto hasTerm = cmdObj.hasField(kTermField);
         return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
     }
@@ -147,6 +148,14 @@ public:
             return qrStatus.getStatus();
         }
 
+        if (!qrStatus.getValue()->getCollation().isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+        }
+
         // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
 
         ExtensionsCallbackReal extensionsCallback(txn, &nss);
@@ -157,9 +166,37 @@ public:
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        AutoGetCollectionForRead ctx(txn, nss);
-        // The collection may be NULL. If so, getExecutor() should handle it by returning
-        // an execution tree with an EOFStage.
+        // Acquire locks. If the namespace is a view, we release our locks and convert the query
+        // request into an aggregation command.
+        AutoGetCollectionOrViewForRead ctx(txn, nss);
+        if (ctx.getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.releaseLocksForView();
+
+            // Convert the find command into an aggregation using $match (and other stages, as
+            // necessary), if possible.
+            const auto& qr = cq->getQueryRequest();
+            auto viewAggregationCommand = qr.asAggregationCommand();
+            if (!viewAggregationCommand.isOK())
+                return viewAggregationCommand.getStatus();
+
+            Command* agg = Command::findCommand("aggregate");
+            std::string errmsg;
+
+            try {
+                agg->run(txn, dbname, viewAggregationCommand.getValue(), 0, errmsg, *out);
+            } catch (DBException& error) {
+                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
+                    return {ErrorCodes::InvalidPipelineOperator,
+                            str::stream() << "Unsupported in view pipeline: " << error.what()};
+                }
+                return error.toStatus();
+            }
+            return Status::OK();
+        }
+
+        // The collection may be NULL. If so, getExecutor() should handle it by returning an
+        // execution tree with an EOFStage.
         Collection* collection = ctx.getCollection();
 
         // We have a parsed query. Time to get the execution plan for it.
@@ -215,6 +252,16 @@ public:
 
         auto& qr = qrStatus.getValue();
 
+        if (!qr->getCollation().isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::InvalidOptions,
+                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
+        }
+
         // Validate term before acquiring locks, if provided.
         if (auto term = qr->getReplicationTerm()) {
             auto replCoord = repl::ReplicationCoordinator::get(txn);
@@ -242,9 +289,35 @@ public:
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        // Acquire locks.
-        AutoGetCollectionForRead ctx(txn, nss);
+        // Acquire locks. If the query is on a view, we release our locks and convert the query
+        // request into an aggregation command.
+        AutoGetCollectionOrViewForRead ctx(txn, nss);
         Collection* collection = ctx.getCollection();
+        if (ctx.getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.releaseLocksForView();
+
+            // Convert the find command into an aggregation using $match (and other stages, as
+            // necessary), if possible.
+            const auto& qr = cq->getQueryRequest();
+            auto viewAggregationCommand = qr.asAggregationCommand();
+            if (!viewAggregationCommand.isOK())
+                return appendCommandStatus(result, viewAggregationCommand.getStatus());
+
+            Command* agg = Command::findCommand("aggregate");
+            try {
+                agg->run(txn, dbname, viewAggregationCommand.getValue(), options, errmsg, result);
+            } catch (DBException& error) {
+                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
+                    return appendCommandStatus(
+                        result,
+                        {ErrorCodes::InvalidPipelineOperator,
+                         str::stream() << "Unsupported in view pipeline: " << error.what()});
+                }
+                return appendCommandStatus(result, error.toStatus());
+            }
+            return true;
+        }
 
         // Get the execution plan for the query.
         auto statusWithPlanExecutor =
@@ -256,7 +329,7 @@ public:
         std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         {
-            stdx::lock_guard<Client>(*txn->getClient());
+            stdx::lock_guard<Client> lk(*txn->getClient());
             CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
         }
 
@@ -294,7 +367,7 @@ public:
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             firstBatch.abandon();
             error() << "Plan executor error during find command: " << PlanExecutor::statestr(state)
-                    << ", stats: " << Explain::getWinningPlanStats(exec.get());
+                    << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
             return appendCommandStatus(result,
                                        Status(ErrorCodes::OperationFailed,
@@ -317,26 +390,25 @@ public:
             // First unregister the PlanExecutor so it can be re-registered with ClientCursor.
             exec->deregisterExec();
 
-            // Create a ClientCursor containing this plan executor. We don't have to worry about
-            // leaking it as it's inserted into a global map by its ctor.
-            ClientCursor* cursor =
-                new ClientCursor(collection->getCursorManager(),
-                                 exec.release(),
-                                 nss.ns(),
-                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                                 originalQR.getOptions(),
-                                 cmdObj.getOwned());
-            cursorId = cursor->cursorid();
+            // Create a ClientCursor containing this plan executor and register it with the cursor
+            // manager.
+            ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
+                {exec.release(),
+                 nss.ns(),
+                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 originalQR.getOptions(),
+                 cmdObj.getOwned()});
+            cursorId = pinnedCursor.getCursor()->cursorid();
 
             invariant(!exec);
-            PlanExecutor* cursorExec = cursor->getExecutor();
+            PlanExecutor* cursorExec = pinnedCursor.getCursor()->getExecutor();
 
             // State will be restored on getMore.
             cursorExec->saveState();
             cursorExec->detachFromOperationContext();
 
-            cursor->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
-            cursor->setPos(numResults);
+            pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
+            pinnedCursor.getCursor()->setPos(numResults);
 
             // Fill out curop based on the results.
             endQueryOp(txn, collection, *cursorExec, numResults, cursorId);

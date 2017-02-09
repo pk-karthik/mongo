@@ -33,9 +33,11 @@
 #include <map>
 #include <string>
 
+#include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_proxy.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
@@ -44,7 +46,7 @@ class OperationContext;
 
 /**
  * Lets you make server level settings easily configurable.
- * Hooks into (set|get)Paramter, as well as command line processing
+ * Hooks into (set|get)Parameter, as well as command line processing
  *
  * NOTE: ServerParameters set at runtime can be read or written to at anytime, and are not
  * thread-safe without atomic types or other concurrency techniques.
@@ -161,7 +163,7 @@ class is_safe_runtime_parameter_type<double> : public std::true_type {};
 template <typename T, ServerParameterType paramType>
 class server_parameter_storage_type {
 public:
-    using value_type = std::atomic<T>;  // NOLINT
+    using value_type = AtomicWord<T>;
 };
 
 template <typename T>
@@ -192,9 +194,9 @@ public:
 template <typename T, ServerParameterType paramType>
 class ExportedServerParameter : public ServerParameter {
 public:
-    static_assert(paramType == ServerParameterType::kStartupOnly ||
-                      is_safe_runtime_parameter_type<T>::value,
-                  "This type is not supported as a runtime server parameter.");
+    MONGO_STATIC_ASSERT_MSG(paramType == ServerParameterType::kStartupOnly ||
+                                is_safe_runtime_parameter_type<T>::value,
+                            "This type is not supported as a runtime server parameter.");
 
     using storage_type = typename server_parameter_storage_type<T, paramType>::value_type;
 
@@ -216,9 +218,7 @@ public:
           _value(value) {}
     virtual ~ExportedServerParameter() {}
 
-    virtual void append(OperationContext* txn, BSONObjBuilder& b, const std::string& name) {
-        b.append(name, *_value);
-    }
+    virtual void append(OperationContext* txn, BSONObjBuilder& b, const std::string& name);
 
     virtual Status set(const BSONElement& newValueElement);
     virtual Status set(const T& newValue);

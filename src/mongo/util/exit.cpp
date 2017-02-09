@@ -32,6 +32,7 @@
 
 #include "mongo/util/exit.h"
 
+#include <boost/optional.hpp>
 #include <stack>
 
 #include "mongo/stdx/condition_variable.h"
@@ -47,6 +48,7 @@ namespace {
 
 stdx::mutex shutdownMutex;
 stdx::condition_variable shutdownTasksComplete;
+boost::optional<ExitCode> shutdownExitCode;
 bool shutdownTasksInProgress = false;
 AtomicUInt32 shutdownFlag;
 std::stack<stdx::function<void()>> shutdownTasks;
@@ -69,19 +71,26 @@ MONGO_COMPILER_NORETURN void logAndQuickExit(ExitCode code) {
     quickExit(code);
 }
 
+void setShutdownFlag() {
+    shutdownFlag.fetchAndAdd(1);
+}
+
 }  // namespace
 
-bool inShutdown() {
+bool globalInShutdownDeprecated() {
     return shutdownFlag.loadRelaxed() != 0;
 }
 
-bool inShutdownStrict() {
-    return shutdownFlag.load() != 0;
+ExitCode waitForShutdown() {
+    stdx::unique_lock<stdx::mutex> lk(shutdownMutex);
+    shutdownTasksComplete.wait(lk, [] { return static_cast<bool>(shutdownExitCode); });
+
+    return shutdownExitCode.get();
 }
 
 void registerShutdownTask(stdx::function<void()> task) {
     stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
-    invariant(!inShutdown());
+    invariant(!globalInShutdownDeprecated());
     shutdownTasks.emplace(std::move(task));
 }
 
@@ -93,7 +102,7 @@ void shutdown(ExitCode code) {
 
         if (shutdownTasksInProgress) {
             // Someone better have called shutdown in some form already.
-            invariant(inShutdown());
+            invariant(globalInShutdownDeprecated());
 
             // Re-entrant calls to shutdown are not allowed.
             invariant(shutdownTasksThreadId != stdx::this_thread::get_id());
@@ -105,7 +114,7 @@ void shutdown(ExitCode code) {
             logAndQuickExit(code);
         }
 
-        shutdownFlag.fetchAndAdd(1);
+        setShutdownFlag();
         shutdownTasksInProgress = true;
         shutdownTasksThreadId = stdx::this_thread::get_id();
 
@@ -117,6 +126,7 @@ void shutdown(ExitCode code) {
     {
         stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
         shutdownTasksInProgress = false;
+        shutdownExitCode.emplace(code);
     }
 
     shutdownTasksComplete.notify_all();
@@ -130,10 +140,10 @@ void shutdownNoTerminate() {
     {
         stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
 
-        if (inShutdown())
+        if (globalInShutdownDeprecated())
             return;
 
-        shutdownFlag.fetchAndAdd(1);
+        setShutdownFlag();
         shutdownTasksInProgress = true;
         shutdownTasksThreadId = stdx::this_thread::get_id();
 
@@ -145,6 +155,7 @@ void shutdownNoTerminate() {
     {
         stdx::lock_guard<stdx::mutex> lock(shutdownMutex);
         shutdownTasksInProgress = false;
+        shutdownExitCode.emplace(EXIT_WINDOWS_SERVICE_STOP);
     }
 
     shutdownTasksComplete.notify_all();

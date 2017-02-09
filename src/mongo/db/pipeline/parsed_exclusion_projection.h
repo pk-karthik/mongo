@@ -30,10 +30,10 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
@@ -71,6 +71,7 @@ public:
      */
     ExclusionNode* addOrGetChild(FieldPath field);
 
+    void addModifiedPaths(std::set<std::string>* modifiedPaths) const;
 
 private:
     // Helpers for addOrGetChild above.
@@ -81,10 +82,10 @@ private:
     Value applyProjectionToValue(Value val) const;
 
     // Fields excluded at this level.
-    std::unordered_set<std::string> _excludedFields;
+    stdx::unordered_set<std::string> _excludedFields;
 
     std::string _pathToNode;
-    std::unordered_map<std::string, std::unique_ptr<ExclusionNode>> _children;
+    stdx::unordered_map<std::string, std::unique_ptr<ExclusionNode>> _children;
 };
 
 /**
@@ -107,14 +108,24 @@ public:
     /**
      * Parses the projection specification given by 'spec', populating internal data structures.
      */
-    void parse(const BSONObj& spec) final {
-        parse(spec, _root.get(), 0);
+    void parse(const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& spec) final {
+        parse(expCtx, spec, _root.get(), 0);
     }
 
     /**
      * Exclude the fields specified.
      */
     Document applyProjection(Document inputDoc) const final;
+
+    DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const final {
+        return DocumentSource::SEE_NEXT;
+    }
+
+    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        std::set<std::string> modifiedPaths;
+        _root->addModifiedPaths(&modifiedPaths);
+        return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths)};
+    }
 
 private:
     /**
@@ -123,7 +134,10 @@ private:
      * Traverses 'spec' and parses each field. Adds any excluded fields at this level to 'node',
      * and recurses on any sub-objects.
      */
-    void parse(const BSONObj& spec, ExclusionNode* node, size_t depth);
+    void parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+               const BSONObj& spec,
+               ExclusionNode* node,
+               size_t depth);
 
 
     // The ExclusionNode tree does most of the execution work once constructed.

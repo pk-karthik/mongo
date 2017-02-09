@@ -29,12 +29,13 @@
 #pragma once
 
 #include <memory>
-#include <unordered_map>
-#include <unordered_set>
 
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
@@ -118,6 +119,16 @@ public:
         return _pathToNode;
     }
 
+    /**
+     * Recursively add all paths that are preserved by this inclusion projection.
+     */
+    void addPreservedPaths(std::set<std::string>* preservedPaths) const;
+
+    /**
+     * Recursively adds all paths that are purely computed in this inclusion projection.
+     */
+    void addComputedPaths(std::set<std::string>* computedPaths) const;
+
 private:
     // Helpers for the Document versions above. These will apply the transformation recursively to
     // each element of any arrays, and ensure non-documents are handled appropriately.
@@ -152,10 +163,10 @@ private:
     std::vector<std::string> _orderToProcessAdditionsAndChildren;
 
     StringMap<boost::intrusive_ptr<Expression>> _expressions;
-    std::unordered_set<std::string> _inclusions;
+    stdx::unordered_set<std::string> _inclusions;
 
     // TODO use StringMap once SERVER-23700 is resolved.
-    std::unordered_map<std::string, std::unique_ptr<InclusionNode>> _children;
+    stdx::unordered_map<std::string, std::unique_ptr<InclusionNode>> _children;
 };
 
 /**
@@ -176,10 +187,10 @@ public:
     /**
      * Parses the projection specification given by 'spec', populating internal data structures.
      */
-    void parse(const BSONObj& spec) final {
+    void parse(const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& spec) final {
         VariablesIdGenerator idGenerator;
         VariablesParseState variablesParseState(&idGenerator);
-        parse(spec, variablesParseState);
+        parse(expCtx, spec, variablesParseState);
         _variables = stdx::make_unique<Variables>(idGenerator.getIdCount());
     }
 
@@ -202,8 +213,15 @@ public:
         _root->optimize();
     }
 
-    void addDependencies(DepsTracker* deps) const final {
+    DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const final {
         _root->addDependencies(deps);
+        return DocumentSource::EXHAUSTIVE_FIELDS;
+    }
+
+    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        std::set<std::string> preservedPaths;
+        _root->addPreservedPaths(&preservedPaths);
+        return {DocumentSource::GetModPathsReturn::Type::kAllExcept, std::move(preservedPaths)};
     }
 
     /**
@@ -227,7 +245,9 @@ private:
      * Parses 'spec' to determine which fields to include, which are computed, and whether to
      * include '_id' or not.
      */
-    void parse(const BSONObj& spec, const VariablesParseState& variablesParseState);
+    void parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+               const BSONObj& spec,
+               const VariablesParseState& variablesParseState);
 
     /**
      * Attempts to parse 'objSpec' as an expression like {$add: [...]}. Adds a computed field to
@@ -237,7 +257,8 @@ private:
      * Throws an error if it was determined to be an expression specification, but failed to parse
      * as a valid expression.
      */
-    bool parseObjectAsExpression(StringData pathToObject,
+    bool parseObjectAsExpression(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                 StringData pathToObject,
                                  const BSONObj& objSpec,
                                  const VariablesParseState& variablesParseState);
 
@@ -245,7 +266,8 @@ private:
      * Traverses 'subObj' and parses each field. Adds any included or computed fields at this level
      * to 'node'.
      */
-    void parseSubObject(const BSONObj& subObj,
+    void parseSubObject(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        const BSONObj& subObj,
                         const VariablesParseState& variablesParseState,
                         InclusionNode* node);
 

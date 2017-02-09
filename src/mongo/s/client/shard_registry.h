@@ -31,14 +31,15 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -56,13 +57,7 @@ public:
     ShardRegistryData() = default;
     ~ShardRegistryData() = default;
 
-
     void swap(ShardRegistryData& other);
-
-    /**
-     * Creates a shard based on the specified information and puts it into the lookup maps.
-     */
-    void addShard(const std::shared_ptr<Shard>&);
 
     /**
      * Lookup shard by replica set name. Returns nullptr if the name can't be found.
@@ -90,6 +85,11 @@ public:
     void addConfigShard(std::shared_ptr<Shard>);
 
     void getAllShardIds(std::set<ShardId>& result) const;
+
+    /**
+     * Erases known by this shardIds from the diff argument.
+     */
+    void shardIdSetDifference(std::set<ShardId>& diff) const;
     void toBSON(BSONObjBuilder* result) const;
     /**
      * If the shard with same replica set name as in the newConnString already exists then replace
@@ -97,25 +97,25 @@ public:
      */
     void rebuildShardIfExists(const ConnectionString& newConnString, ShardFactory* factory);
 
-    /**
-     * Rebuilds config shard. The result is to recreate a ReplicaSetMonitor in the case it does
-     * not exist.
-     */
-    void rebuildConfigShard(ShardFactory* factory);
-
 private:
     /**
      * Reads shards docs from the catalog client and fills in maps.
      */
     void _init(OperationContext* txn, ShardFactory* factory);
 
-    void _addShard_inlock(const std::shared_ptr<Shard>&);
+    /**
+     * Creates a shard based on the specified information and puts it into the lookup maps.
+     * if useOriginalCS = true it will use the ConnectionSring used for shard creation to update
+     * lookup maps. Otherwise the current connection string from the Shard's RemoteCommandTargeter
+     * will be used.
+     */
+    void _addShard_inlock(const std::shared_ptr<Shard>&, bool useOriginalCS);
     std::shared_ptr<Shard> _findByShardId_inlock(const ShardId&) const;
     void _rebuildShard_inlock(const ConnectionString& newConnString, ShardFactory* factory);
 
     // Protects the lookup maps below.
     mutable stdx::mutex _mutex;
-    using ShardMap = std::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
+    using ShardMap = stdx::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
 
     // Map of both shardName -> Shard and hostName -> Shard
     ShardMap _lookup;
@@ -123,7 +123,7 @@ private:
     // Map from replica set name to shard corresponding to this replica set
     ShardMap _rsLookup;
 
-    std::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
+    stdx::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
 
     // store configShard separately to always have a reference
     std::shared_ptr<Shard> _configShard;
@@ -148,19 +148,13 @@ public:
     ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
                   const ConnectionString& configServerCS);
 
-    ~ShardRegistry() = default;
-
+    ~ShardRegistry();
     /**
      *  Starts ReplicaSetMonitor by adding a config shard.
      */
     void startup();
 
     ConnectionString getConfigServerConnectionString() const;
-
-    /**
-     * Returns the cluster id from the config shard.
-     */
-    const OID& getClusterId() const;
 
     /**
      * Reloads the ShardRegistry based on the contents of the config server's config.shards
@@ -173,14 +167,6 @@ public:
     bool reload(OperationContext* txn);
 
     /**
-     * Throws out and reconstructs the config shard.  This has the effect that if replica set
-     * monitoring of the config server replica set has stopped (because the set was down for too
-     * long), this will cause the ReplicaSetMonitor to be rebuilt, which will re-trigger monitoring
-     * of the config replica set to resume.
-     */
-    void rebuildConfigShard();
-
-    /**
      * Takes a connection string describing either a shard or config server replica set, looks
      * up the corresponding Shard object based on the replica set name, then updates the
      * ShardRegistry's notion of what hosts make up that shard.
@@ -188,12 +174,14 @@ public:
     void updateReplSetHosts(const ConnectionString& newConnString);
 
     /**
-     * Returns a shared pointer to the shard object with the given shard id.
+     * Returns a shared pointer to the shard object with the given shard id, or ShardNotFound error
+     * otherwise.
+     *
      * May refresh the shard registry if there's no cached information about the shard. The shardId
      * parameter can actually be the shard name or the HostAndPort for any
      * server in the shard.
      */
-    std::shared_ptr<Shard> getShard(OperationContext* txn, const ShardId& shardId);
+    StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* txn, const ShardId& shardId);
 
     /**
      * Returns a shared pointer to the shard object with the given shard id. The shardId parameter
@@ -233,6 +221,37 @@ public:
 
     void getAllShardIds(std::vector<ShardId>* all) const;
     void toBSON(BSONObjBuilder* result) const;
+    bool isUp() const;
+
+    /**
+     * Initializes ShardRegistry with config shard. Must be called outside c-tor to avoid calls on
+     * this while its still not fully constructed.
+     */
+    void init();
+
+    /**
+     * Shuts down _executor. Needs to be called explicitly because ShardRegistry is never destroyed
+     * as it's owned by the static grid object.
+     */
+    void shutdown();
+
+    /**
+     * For use in mongos and mongod which needs notifications about changes to shard and config
+     * server replset membership to update the ShardRegistry.
+     *
+     * This is expected to be run in an existing thread.
+     */
+    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
+                                                        const std::string& newConnectionString);
+
+    /**
+     * For use in mongos which needs notifications about changes to shard replset membership to
+     * update the config.shards collection.
+     *
+     * This is expected to be run in a brand new thread.
+     */
+    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
+                                                       const std::string& newConnectionString);
 
 private:
     /**
@@ -245,13 +264,7 @@ private:
      * shard
      */
     ConnectionString _initConfigServerCS;
-
-    /**
-     * The id for the cluster, obtained from the config servers on sharding initialization. The
-     * config servers are the authority on the clusterId.
-     */
-    const OID _clusterId;
-
+    void _internalReload(const executor::TaskExecutor::CallbackArgs& cbArgs);
     ShardRegistryData _data;
 
     // Protects the _reloadState and _initConfigServerCS during startup.
@@ -265,7 +278,13 @@ private:
     };
 
     ReloadState _reloadState{ReloadState::Idle};
-};
+    bool _isUp{false};
 
+    // Executor for reloading.
+    std::unique_ptr<executor::TaskExecutor> _executor{};
+
+    // Set to true in shutdown call to prevent calling it twice.
+    bool _isShutdown{false};
+};
 
 }  // namespace mongo

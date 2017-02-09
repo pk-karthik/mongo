@@ -42,10 +42,9 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_exception.h"
@@ -332,11 +331,13 @@ void ParallelSortClusteredCursor::fullInit(OperationContext* txn) {
     finishInit(txn);
 }
 
-void ParallelSortClusteredCursor::_markStaleNS(const NamespaceString& staleNS,
+void ParallelSortClusteredCursor::_markStaleNS(OperationContext* txn,
+                                               const NamespaceString& staleNS,
                                                const StaleConfigException& e,
-                                               bool& forceReload,
-                                               bool& fullReload) {
-    fullReload = e.requiresFullReload();
+                                               bool& forceReload) {
+    if (e.requiresFullReload()) {
+        Grid::get(txn)->catalogCache()->invalidate(staleNS.db());
+    }
 
     if (_staleNSMap.find(staleNS.ns()) == _staleNSMap.end())
         _staleNSMap[staleNS.ns()] = 1;
@@ -355,28 +356,17 @@ void ParallelSortClusteredCursor::_markStaleNS(const NamespaceString& staleNS,
 
 void ParallelSortClusteredCursor::_handleStaleNS(OperationContext* txn,
                                                  const NamespaceString& staleNS,
-                                                 bool forceReload,
-                                                 bool fullReload) {
-    auto status = grid.catalogCache()->getDatabase(txn, staleNS.db().toString());
-    if (!status.isOK()) {
-        warning() << "cannot reload database info for stale namespace " << staleNS.ns();
+                                                 bool forceReload) {
+    auto scopedCMStatus = ScopedChunkManager::get(txn, staleNS);
+    if (!scopedCMStatus.isOK()) {
+        log() << "cannot reload database info for stale namespace " << staleNS.ns();
         return;
     }
 
-    shared_ptr<DBConfig> config = status.getValue();
+    const auto& scopedCM = scopedCMStatus.getValue();
 
-    // Reload db if needed, make sure it works
-    if (fullReload && !config->reload(txn)) {
-        // We didn't find the db after reload, the db may have been dropped, reset this ptr
-        config.reset();
-    }
-
-    if (!config) {
-        warning() << "cannot reload database info for stale namespace " << staleNS.ns();
-    } else {
-        // Reload chunk manager, potentially forcing the namespace
-        config->getChunkManagerIfExists(txn, staleNS.ns(), true, forceReload);
-    }
+    // Reload chunk manager, potentially forcing the namespace
+    scopedCM.db()->getChunkManagerIfExists(txn, staleNS.ns(), true, forceReload);
 }
 
 void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
@@ -397,7 +387,7 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
 
     // Setup conn
     if (!state->conn) {
-        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
+        const auto shard = uassertStatusOK(Grid::get(txn)->shardRegistry()->getShard(txn, shardId));
         state->conn.reset(new ShardConnection(shard->getConnString(), ns.ns(), manager));
     }
 
@@ -410,6 +400,9 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
         const DBClientReplicaSet* replConn = dynamic_cast<const DBClientReplicaSet*>(rawConn);
         invariant(replConn);
         ReplicaSetMonitorPtr rsMonitor = ReplicaSetMonitor::get(replConn->getSetName());
+        uassert(16388,
+                str::stream() << "cannot access unknown replica set: " << replConn->getSetName(),
+                rsMonitor != nullptr);
         if (!rsMonitor->isKnownToHaveGoodPrimary()) {
             state->conn->donotCheckVersion();
 
@@ -461,9 +454,6 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
     const bool returnPartial = (_qSpec.options() & QueryOption_PartialResults);
     const NamespaceString nss(!_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns());
 
-    shared_ptr<ChunkManager> manager;
-    shared_ptr<Shard> primary;
-
     string prefix;
     if (MONGO_unlikely(shouldLog(pc))) {
         if (_totalTries > 0) {
@@ -474,18 +464,21 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
     }
     LOG(pc) << prefix << " pcursor over " << _qSpec << " and " << _cInfo;
 
-    set<ShardId> shardIds;
-    string vinfo;
+    shared_ptr<ChunkManager> manager;
+    shared_ptr<Shard> primary;
 
     {
-        shared_ptr<DBConfig> config;
-
-        auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
-        if (status.getStatus().code() != ErrorCodes::NamespaceNotFound) {
-            config = uassertStatusOK(status);
-            config->getChunkManagerOrPrimary(txn, nss.ns(), manager, primary);
+        auto scopedCMStatus = ScopedChunkManager::get(txn, nss);
+        if (scopedCMStatus != ErrorCodes::NamespaceNotFound) {
+            uassertStatusOK(scopedCMStatus.getStatus());
+            const auto& scopedCM = scopedCMStatus.getValue();
+            manager = scopedCM.cm();
+            primary = scopedCM.primary();
         }
     }
+
+    set<ShardId> shardIds;
+    string vinfo;
 
     if (manager) {
         if (MONGO_unlikely(shouldLog(pc))) {
@@ -493,8 +486,10 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
                                   << manager->getVersion().toString() << "]";
         }
 
-        manager->getShardIdsForQuery(
-            txn, !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter(), &shardIds);
+        manager->getShardIdsForQuery(txn,
+                                     !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter(),
+                                     !_cInfo.isEmpty() ? _cInfo.cmdCollation : BSONObj(),
+                                     &shardIds);
     } else if (primary) {
         if (MONGO_unlikely(shouldLog(pc))) {
             vinfo = str::stream() << "[unsharded @ " << primary->toString() << "]";
@@ -643,7 +638,6 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
                 mdata.finished = true;
             }
 
-
             LOG(pc) << "initialized " << (isCommand() ? "command " : "query ")
                     << (lazyInit ? "(lazily) " : "(full) ") << "on shard " << shardId
                     << ", current connection state is " << mdata.toBSON();
@@ -657,27 +651,26 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
                 staleNS = nss;  // ns is the *versioned* namespace, be careful of this
 
             // Probably need to retry fully
-            bool forceReload, fullReload;
-            _markStaleNS(staleNS, e, forceReload, fullReload);
+            bool forceReload;
+            _markStaleNS(txn, staleNS, e, forceReload);
 
-            int logLevel = fullReload ? 0 : 1;
-            LOG(pc + logLevel) << "stale config of ns " << staleNS
-                               << " during initialization, will retry with forced : " << forceReload
-                               << ", full : " << fullReload << causedBy(e);
+            LOG(1) << "stale config of ns " << staleNS
+                   << " during initialization, will retry with forced : " << forceReload
+                   << causedBy(redact(e));
 
             // This is somewhat strange
             if (staleNS != nss)
                 warning() << "versioned ns " << nss.ns() << " doesn't match stale config namespace "
                           << staleNS;
 
-            _handleStaleNS(txn, staleNS, forceReload, fullReload);
+            _handleStaleNS(txn, staleNS, forceReload);
 
             // Restart with new chunk manager
             startInit(txn);
             return;
         } catch (SocketException& e) {
             warning() << "socket exception when initializing on " << shardId
-                      << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                      << ", current connection state is " << mdata.toBSON() << causedBy(redact(e));
             e._shard = shardId.toString();
             mdata.errored = true;
             if (returnPartial) {
@@ -687,7 +680,7 @@ void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
             throw;
         } catch (DBException& e) {
             warning() << "db exception when initializing on " << shardId
-                      << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                      << ", current connection state is " << mdata.toBSON() << causedBy(redact(e));
             e._shard = shardId.toString();
             mdata.errored = true;
             if (returnPartial && e.getCode() == 15925 /* From above! */) {
@@ -826,7 +819,7 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
             continue;
         } catch (SocketException& e) {
             warning() << "socket exception when finishing on " << shardId
-                      << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                      << ", current connection state is " << mdata.toBSON() << causedBy(redact(e));
             mdata.errored = true;
             if (returnPartial) {
                 mdata.cleanup(true);
@@ -838,7 +831,8 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
             // ABOVE
             if (e.getCode() == 15988) {
                 warning() << "exception when receiving data from " << shardId
-                          << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                          << ", current connection state is " << mdata.toBSON()
+                          << causedBy(redact(e));
 
                 mdata.errored = true;
                 if (returnPartial) {
@@ -851,10 +845,11 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
                 // don't print/call "mdata.toBSON()" to avoid unexpected errors e.g. a segfault
                 if (e.getCode() == 22)
                     warning() << "bson is malformed :: db exception when finishing on " << shardId
-                              << causedBy(e);
+                              << causedBy(redact(e));
                 else
                     warning() << "db exception when finishing on " << shardId
-                              << ", current connection state is " << mdata.toBSON() << causedBy(e);
+                              << ", current connection state is " << mdata.toBSON()
+                              << causedBy(redact(e));
                 mdata.errored = true;
                 throw;
             }
@@ -882,21 +877,19 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
                 NamespaceString staleNS(i->first);
                 const StaleConfigException& exception = i->second;
 
-                bool forceReload, fullReload;
-                _markStaleNS(staleNS, exception, forceReload, fullReload);
+                bool forceReload;
+                _markStaleNS(txn, staleNS, exception, forceReload);
 
-                int logLevel = fullReload ? 0 : 1;
-                LOG(pc + logLevel)
-                    << "stale config of ns " << staleNS
-                    << " on finishing query, will retry with forced : " << forceReload
-                    << ", full : " << fullReload << causedBy(exception);
+                LOG(1) << "stale config of ns " << staleNS
+                       << " on finishing query, will retry with forced : " << forceReload
+                       << causedBy(redact(exception));
 
                 // This is somewhat strange
                 if (staleNS != ns)
                     warning() << "versioned ns " << ns << " doesn't match stale config namespace "
                               << staleNS;
 
-                _handleStaleNS(txn, staleNS, forceReload, fullReload);
+                _handleStaleNS(txn, staleNS, forceReload);
             }
         }
 
@@ -943,7 +936,8 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
         _cursors[index].reset(mdata.pcState->cursor.get(), &mdata);
 
         {
-            const auto shard = grid.shardRegistry()->getShard(txn, i->first);
+            const auto shard =
+                uassertStatusOK(Grid::get(txn)->shardRegistry()->getShard(txn, i->first));
             _servers.insert(shard->getConnString().toString());
         }
 
@@ -1060,7 +1054,8 @@ void ParallelSortClusteredCursor::_oldInit() {
             }
 
             LOG(5) << "ParallelSortClusteredCursor::init server:" << serverHost << " ns:" << _ns
-                   << " query:" << _query << " fields:" << _fields << " options: " << _options;
+                   << " query:" << redact(_query) << " fields:" << redact(_fields)
+                   << " options: " << _options;
 
             if (!_cursors[i].get())
                 _cursors[i].reset(
@@ -1212,7 +1207,7 @@ void ParallelSortClusteredCursor::_oldInit() {
         } else if (throwException) {
             throw DBException(errMsg.str(), 14827);
         } else {
-            warning() << errMsg.str();
+            warning() << redact(errMsg.str());
         }
     }
 
